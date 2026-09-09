@@ -335,10 +335,31 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         name="Start Frame",
         default=1.0,
     )
+    humanoid_preset: EnumProperty(
+        name="Humanoid Mapping",
+        description="Avatar bone mapping used to reconstruct Unity Humanoid muscle curves",
+        items=(
+            (
+                'BIP001_PELVIS_HIPS',
+                "Bip001 (Hips: Bip001 Pelvis)",
+                "Common Bip001 Avatar mapping with Hips assigned to Bip001 Pelvis",
+            ),
+            (
+                'BIP001_ROOT_HIPS',
+                "Bip001 (Hips: Bip001)",
+                "Bip001 variant used by FBX assets whose Unity Avatar requires Hips assigned to Bip001",
+            ),
+        ),
+        default='BIP001_PELVIS_HIPS',
+    )
     root_motion: EnumProperty(
         name="Root Motion",
         items=(
-            ('IGNORE', "Ignore", "Do not apply Animator RootT/RootQ or MotionT/MotionQ curves"),
+            (
+                'IGNORE',
+                "Keep on Hips",
+                "Keep Humanoid RootT/RootQ on the Hips bone without extracting separate root motion",
+            ),
             ('ARMATURE', "Armature Object", "Extract root motion to the armature object and remove it from the root bone"),
             ('ROOT_BONE', "Root Bone", "Apply root motion to the single resolved root bone"),
         ),
@@ -356,7 +377,12 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         try:
             clip = unity_anim.load(self.filepath)
             action, mapped_count, unresolved = unity_anim_action.import_clip(
-                clip, armature, self.frame_start, self.root_motion)
+                clip,
+                armature,
+                self.frame_start,
+                self.root_motion,
+                self.humanoid_preset,
+            )
         except (OSError, ValueError) as ex:
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}

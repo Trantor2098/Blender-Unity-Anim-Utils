@@ -1,8 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Standalone Unity Humanoid calibration for the common Bip001 skeleton profile.
+"""Standalone Unity Humanoid calibration for common Bip001 skeleton profiles.
 
 Quaternion tuples have already been converted to Blender/mathutils order: (w, x, y, z).
 """
+
+HUMANOID_PRESET_BIP001_PELVIS = 'BIP001_PELVIS_HIPS'
+HUMANOID_PRESET_BIP001_ROOT = 'BIP001_ROOT_HIPS'
+DEFAULT_HUMANOID_PRESET = HUMANOID_PRESET_BIP001_PELVIS
+
+# The muscle calibration is shared by both variants.  Only Unity's Hips mapping
+# changes: most Bip001 FBX Avatars map Hips to ``Bip001 Pelvis``, while some
+# assets (including the GI variant) require the parent ``Bip001`` node instead.
+HUMANOID_PRESETS = {
+    HUMANOID_PRESET_BIP001_PELVIS: {
+        "name": "Bip001 (Hips: Bip001 Pelvis)",
+        "hips_bone": "Bip001 Pelvis",
+    },
+    HUMANOID_PRESET_BIP001_ROOT: {
+        "name": "Bip001 (Hips: Bip001)",
+        "hips_bone": "Bip001",
+    },
+}
 
 BIPED_HUMANOID_PROFILE = {
     'Bip001 L Thigh': {

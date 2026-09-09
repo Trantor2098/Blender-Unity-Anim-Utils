@@ -7,7 +7,11 @@ import bpy
 from bpy_extras import anim_utils
 from mathutils import Euler, Matrix, Quaternion, Vector
 
-from .humanoid_biped_profile import BIPED_HUMANOID_PROFILE
+from .humanoid_biped_profile import (
+    BIPED_HUMANOID_PROFILE,
+    DEFAULT_HUMANOID_PRESET,
+    HUMANOID_PRESETS,
+)
 
 
 def _finite_slope(slope, fallback):
@@ -393,7 +397,13 @@ def _write_matrix_channels(channelbag, target, matrices, frame_start, group_name
             fcurve.update()
 
 
-def import_clip(clip, armature, frame_start=1.0, root_motion='IGNORE'):
+def import_clip(
+        clip, armature, frame_start=1.0, root_motion='IGNORE',
+        humanoid_preset=DEFAULT_HUMANOID_PRESET):
+    preset = HUMANOID_PRESETS.get(humanoid_preset)
+    if preset is None:
+        raise ValueError(f"Unknown Humanoid mapping preset: {humanoid_preset}")
+
     full_paths, suffix_paths = _bone_paths(armature)
     curve_groups = {}
     for kind, curves in (
@@ -447,6 +457,34 @@ def import_clip(clip, armature, frame_start=1.0, root_motion='IGNORE'):
             continue
         mapped.append(("Humanoid/" + bone_name, bone_name, {"humanoid": profile}))
         humanoid_count += 1
+
+    # RootT/RootQ contain the Humanoid body-root pose.  Unity applies them to
+    # whichever Transform the Avatar maps as Hips.  That Transform is not
+    # necessarily the anatomical pelvis: some Bip001 FBX variants must map
+    # Hips to the parent ``Bip001`` bone.  Keep this choice in the preset and
+    # leave explicit Transform curves authoritative if the clip has one.
+    float_groups = _float_curve_groups(clip)
+    humanoid_hips_bone = preset["hips_bone"]
+    humanoid_root_group = {
+        'translation': float_groups.get('RootT', {}),
+        'rotation': float_groups.get('RootQ', {}),
+    }
+    has_humanoid_root = any(humanoid_root_group.values())
+    humanoid_hips_applied = False
+    if (humanoid_count
+            and has_humanoid_root
+            and humanoid_hips_bone in armature.data.bones
+            and humanoid_hips_bone not in native_bones):
+        mapped.append((
+            "Humanoid/Hips",
+            humanoid_hips_bone,
+            {"humanoid_root": humanoid_root_group},
+        ))
+        native_bones.add(humanoid_hips_bone)
+        humanoid_count += 1
+        humanoid_hips_applied = True
+    elif humanoid_count and has_humanoid_root and humanoid_hips_bone not in armature.data.bones:
+        unresolved.append(f"Humanoid/Hips ({humanoid_hips_bone})")
     if not mapped:
         raise ValueError("No Unity Transform or supported Humanoid curves matched the selected armature")
 
@@ -475,7 +513,6 @@ def import_clip(clip, armature, frame_start=1.0, root_motion='IGNORE'):
     armature_root_matrices = None
 
     if root_motion != 'IGNORE':
-        float_groups = _float_curve_groups(clip)
         translation = float_groups.get('RootT') or float_groups.get('MotionT')
         rotation = float_groups.get('RootQ') or float_groups.get('MotionQ')
         if translation or rotation:
@@ -514,28 +551,37 @@ def import_clip(clip, armature, frame_start=1.0, root_motion='IGNORE'):
                 source_rest = pose_bone.parent.bone.matrix_local.inverted_safe() @ source_rest
         source_loc, source_rot, source_scale = source_rest.decompose()
         correction = corrections[bone_name]
+        humanoid_root_matrices = None
+        if curves.get('humanoid_root'):
+            humanoid_root_matrices = _root_motion_source_matrices(
+                curves['humanoid_root'], times, source_rest)
         previous_rotation = None
         channel_values = [[] for _ in range(10)]
 
         for sample_index, time in enumerate(times):
-            position_curve = curves.get('position')
-            position = (_unity_to_fbx_vector(_evaluate_curve(position_curve, time, 3, (0.0, 0.0, 0.0)))
-                        if position_curve else source_loc)
-            scale = _evaluate_curve(curves.get('scale'), time, 3, source_scale)
-            if curves.get('humanoid'):
-                rotation = _evaluate_humanoid_rotation(
-                    curves['humanoid'], muscle_curves, time, source_rot,
-                    muscle_values_are_degrees)
-            elif curves.get('rotation'):
-                rotation = _unity_to_fbx_quaternion(_evaluate_curve(
-                    curves['rotation'], time, 4, (0.0, 0.0, 0.0, 1.0)))
-            elif curves.get('euler'):
-                euler = _evaluate_curve(curves['euler'], time, 3, (0.0, 0.0, 0.0))
-                rotation = _unity_to_fbx_rotation(
-                    Euler(tuple(math.radians(value) for value in euler), 'ZXY').to_quaternion())
+            if humanoid_root_matrices is not None:
+                source_local = humanoid_root_matrices[sample_index]
+                position, rotation, scale = source_local.decompose()
             else:
-                rotation = source_rot
-            source_local = Matrix.LocRotScale(position, rotation, Vector(scale))
+                position_curve = curves.get('position')
+                position = (_unity_to_fbx_vector(_evaluate_curve(
+                    position_curve, time, 3, (0.0, 0.0, 0.0)))
+                    if position_curve else source_loc)
+                scale = _evaluate_curve(curves.get('scale'), time, 3, source_scale)
+                if curves.get('humanoid'):
+                    rotation = _evaluate_humanoid_rotation(
+                        curves['humanoid'], muscle_curves, time, source_rot,
+                        muscle_values_are_degrees)
+                elif curves.get('rotation'):
+                    rotation = _unity_to_fbx_quaternion(_evaluate_curve(
+                        curves['rotation'], time, 4, (0.0, 0.0, 0.0, 1.0)))
+                elif curves.get('euler'):
+                    euler = _evaluate_curve(curves['euler'], time, 3, (0.0, 0.0, 0.0))
+                    rotation = _unity_to_fbx_rotation(
+                        Euler(tuple(math.radians(value) for value in euler), 'ZXY').to_quaternion())
+                else:
+                    rotation = source_rot
+                source_local = Matrix.LocRotScale(position, rotation, Vector(scale))
             if root_motion == 'ARMATURE' and pose_bone == root_bone:
                 # Move the root delta to the Armature object without applying it twice.
                 source_local = root_source_deltas[sample_index].inverted_safe() @ source_local
@@ -586,7 +632,9 @@ def import_clip(clip, armature, frame_start=1.0, root_motion='IGNORE'):
     action["unity_unresolved_paths"] = unresolved
     action["unity_duplicate_paths"] = duplicate_paths
     action["unity_root_motion"] = root_motion
-    action["unity_humanoid_profile"] = "Bip001 calibrated" if humanoid_count else ""
+    action["unity_humanoid_profile"] = preset["name"] if humanoid_count else ""
+    action["unity_humanoid_preset"] = humanoid_preset if humanoid_count else ""
+    action["unity_humanoid_hips_bone"] = humanoid_hips_bone if humanoid_hips_applied else ""
     action["unity_humanoid_bones"] = humanoid_count
     action["unity_humanoid_units"] = "degrees" if muscle_values_are_degrees else "normalized"
     return action, len(mapped), unresolved
