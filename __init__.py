@@ -352,6 +352,14 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         ),
         default='BIP001_PELVIS_HIPS',
     )
+    use_bip001_avatar_calibration: BoolProperty(
+        name="GI Bip001 Avatar Calibration",
+        description=(
+            "Apply the model-specific Unity body-center, height, and constant "
+            "upper-arm twist corrections calibrated for the GI Bip001 rig"
+        ),
+        default=False,
+    )
     root_motion: EnumProperty(
         name="Root Motion",
         items=(
@@ -382,15 +390,17 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
                 self.frame_start,
                 self.root_motion,
                 self.humanoid_preset,
+                self.use_bip001_avatar_calibration,
             )
         except (OSError, ValueError) as ex:
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
 
-        self.report(
-            {'INFO'},
-            f"Imported {action.name}: {mapped_count} paths mapped, {len(unresolved)} unresolved",
-        )
+        message = f"Imported {action.name}: {mapped_count} paths mapped, {len(unresolved)} unresolved"
+        warning = action.get("unity_humanoid_warning")
+        if warning:
+            message += f"; {warning}"
+        self.report({'WARNING'} if warning else {'INFO'}, message)
         return {'FINISHED'}
 
 
