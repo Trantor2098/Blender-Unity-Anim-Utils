@@ -2846,6 +2846,13 @@ class FbxImportHelperNode:
         pose_bone.bone["unity_fbx_source_rest"] = tuple(
             value for row in self.bind_matrix.normalized() for value in row
         ) if self.bind_matrix else tuple(value for row in Matrix() for value in row)
+        # Keep the un-oriented FBX default local transform alongside the source
+        # rest transform.  This allows the optional post-import pose pass to use
+        # exactly the same recursive bone-axis correction as Unity .anim import.
+        source_default = self.matrix.normalized() if self.matrix else Matrix()
+        pose_bone.bone["unity_fbx_source_default"] = tuple(
+            value for row in source_default for value in row
+        )
 
         # `self.fbx_elem` can be `None` in cases where the imported hierarchy contains a mix of bone and non-bone FBX
         # Nodes parented to one another, e.g. "bone1"->"mesh1"->"bone2". In Blender, an Armature can only consist of
@@ -3159,6 +3166,7 @@ def load(operator, context, filepath="",
          force_connect_children=False,
          automatic_bone_orientation=False,
          bone_orientation_mode='ORIGINAL',
+         fbx_pose_mode='KEEP',
          primary_bone_axis='Y',
          secondary_bone_axis='X',
          use_prepost_rot=True,
@@ -4151,6 +4159,22 @@ def load(operator, context, filepath="",
     if bake_unity_axis:
         perfmon.step("FBX import: Bake axis conversion...")
         bake_imported_root_axis_conversion(fbx_helper_nodes[0], view_layer, operator.report)
+
+    if fbx_pose_mode != 'KEEP':
+        perfmon.step("FBX import: Resolve default pose...")
+        from .unity_anim_action import apply_fbx_default_pose
+
+        imported_armatures = []
+        pending_helpers = [fbx_helper_nodes[0]]
+        while pending_helpers:
+            helper = pending_helpers.pop()
+            if helper.is_armature and helper.bl_obj is not None:
+                imported_armatures.append(helper.bl_obj)
+            pending_helpers.extend(helper.children)
+
+        for armature in imported_armatures:
+            apply_fbx_default_pose(armature, fbx_pose_mode)
+        view_layer.update()
 
     perfmon.level_down()
 

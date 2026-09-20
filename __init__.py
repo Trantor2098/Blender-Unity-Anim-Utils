@@ -182,6 +182,28 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         ),
         default='BETTER_FBX',
     )
+    fbx_pose_mode: EnumProperty(
+        name="Default Pose",
+        description="How to handle the default pose stored in the FBX",
+        items=(
+            (
+                'KEEP',
+                "Keep",
+                "Keep the FBX pose as imported",
+            ),
+            (
+                'CLEAR',
+                "Clear",
+                "Clear pose transforms after import (imported animation actions are not removed)",
+            ),
+            (
+                'ANIM_RETARGET',
+                "Retarget Like Unity Anim",
+                "Resolve the FBX default pose with the same rest-pose and bone-axis corrections as Unity .anim import",
+            ),
+        ),
+        default='KEEP',
+    )
     primary_bone_axis: EnumProperty(
         name="Primary Bone Axis",
         items=(('X', "X Axis", ""),
@@ -316,6 +338,7 @@ def import_panel_armature(layout, operator):
         body.prop(operator, "ignore_leaf_bones")
         body.prop(operator, "force_connect_children"),
         body.prop(operator, "bone_orientation_mode")
+        body.prop(operator, "fbx_pose_mode")
         sub = body.column()
         sub.enabled = operator.bone_orientation_mode == 'ORIGINAL'
         sub.prop(operator, "primary_bone_axis")

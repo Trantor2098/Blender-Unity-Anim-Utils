@@ -122,6 +122,32 @@ def _bone_retarget_corrections(armature):
     return corrections
 
 
+def apply_fbx_default_pose(armature, mode):
+    """Apply an FBX default-pose policy without changing imported actions."""
+    if mode == 'KEEP':
+        return
+    if mode == 'CLEAR':
+        for pose_bone in armature.pose.bones:
+            pose_bone.matrix_basis = Matrix()
+        return
+    if mode != 'ANIM_RETARGET':
+        raise ValueError(f"Unsupported FBX default pose mode: {mode!r}")
+
+    corrections = _bone_retarget_corrections(armature)
+    for pose_bone in armature.pose.bones:
+        source_rest = _matrix_from_property(pose_bone.bone.get("unity_fbx_source_rest"))
+        source_default = _matrix_from_property(pose_bone.bone.get("unity_fbx_source_default"))
+        correction = corrections.get(pose_bone.name)
+        if source_rest is None or source_default is None or correction is None:
+            continue
+        pose_bone.matrix_basis = (
+            correction.inverted_safe()
+            @ source_rest.inverted_safe()
+            @ source_default
+            @ correction
+        )
+
+
 def _bone_paths(armature):
     full_paths = {}
     suffix_paths = {}
