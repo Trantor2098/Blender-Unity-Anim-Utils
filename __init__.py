@@ -144,6 +144,27 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         description="Offset to apply to animation during import, in frames",
         default=1.0,
     )
+    import_companion_anim: BoolProperty(
+        name="Import Companion Unity Animations",
+        description="After the FBX import, import the Unity .anim clips found next to the FBX file "
+        "onto the imported armature (one action per clip)",
+        default=True,
+    )
+    anim_use_fake_user: BoolProperty(
+        name="Fake User",
+        description="Mark companion imported actions with a fake user so they are kept on save/reload",
+        default=True,
+    )
+    anim_name_collision_mode: EnumProperty(
+        name="Name Collision",
+        description="Behavior when a companion imported action has the same name as an existing action",
+        items=(
+            ("OVERWRITE", "Overwrite", "Replace the curves of the existing same-named action"),
+            ("REUSE", "Keep Existing", "Skip clips whose action name already exists"),
+            ("RENAME", "Rename (Increment)", "Import as a new action with an incremented .001 suffix"),
+        ),
+        default='OVERWRITE',
+    )
 
     use_subsurf: BoolProperty(
         name="Subdivision Data",
@@ -241,6 +262,36 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         default='MAKE_UNIQUE',
         description="Behavior when the name of an imported material conflicts with an existing material",
     )
+    material_preset: EnumProperty(
+        name="Material Preset",
+        description="How the material node tree is generated from FBX data",
+        items=(
+            (
+                "PRINCIPLED",
+                "Principled BSDF (Full FBX)",
+                "Generate a Principled BSDF from FBX data, connecting diffuse and normal maps, "
+                "roughness, metalness and emission if present",
+            ),
+            (
+                "PRINCIPLED_DEFAULT",
+                "Principled BSDF (Default)",
+                "Generate a default Principled BSDF, only connect the diffuse texture to it, "
+                "and place the other imported texture nodes in the material node tree without connecting them",
+            ),
+            (
+                "DIFFUSE",
+                "Diffuse BSDF (Default)",
+                "Same as the default Principled BSDF, but use a Diffuse BSDF instead",
+            ),
+            (
+                "UNLIT",
+                "Unlit",
+                "Connect the diffuse texture straight to the material output, "
+                "and place the other imported texture nodes without connecting them",
+            ),
+        ),
+        default='PRINCIPLED_DEFAULT',
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -254,24 +305,98 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         import_panel_armature(layout, self)
 
     def execute(self, context):
-        keywords = self.as_keywords(ignore=("filter_glob", "directory", "ui_tab", "filepath", "files"))
+        keywords = self.as_keywords(
+            ignore=("filter_glob", "directory", "ui_tab", "filepath", "files",
+                    "import_companion_anim", "anim_use_fake_user", "anim_name_collision_mode"),
+        )
         keywords["automatic_bone_orientation"] = self.bone_orientation_mode == 'BLENDER_AUTO'
 
         from . import import_fbx
         import os
 
         if self.files:
-            ret = {'CANCELLED'}
-            for file in self.files:
-                path = os.path.join(self.directory, file.name)
-                if import_fbx.load(self, context, filepath=path, **keywords) == {'FINISHED'}:
-                    ret = {'FINISHED'}
-            return ret
+            paths = [os.path.join(self.directory, file.name) for file in self.files]
         else:
-            return import_fbx.load(self, context, filepath=self.filepath, **keywords)
+            paths = [self.filepath]
 
-    def invoke(self, context, event):
-        return self.invoke_popup(context)
+        # Recorded before the FBX import so only armatures created by this
+        # very import are eligible targets for companion .anim clips.
+        armature_names_before = {obj.name for obj in bpy.data.objects if obj.type == 'ARMATURE'}
+
+        ret = {'CANCELLED'}
+        imported_fbx = []
+        for path in paths:
+            if import_fbx.load(self, context, filepath=path, **keywords) == {'FINISHED'}:
+                ret = {'FINISHED'}
+                imported_fbx.append(path)
+
+        if self.import_companion_anim:
+            self._import_companion_animations(
+                context, imported_fbx, armature_names_before)
+
+        return ret
+
+    def _import_companion_animations(self, context, fbx_paths, armature_names_before):
+        """Import the Unity .anim clips found next to the imported FBX files."""
+        import glob
+        import os
+        from . import unity_anim, unity_anim_action
+
+        if not fbx_paths:
+            return
+
+        imported_armatures = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'ARMATURE' and obj.name not in armature_names_before
+        ]
+        if not imported_armatures:
+            return
+
+        # Multiple FBX files may share a directory; import each clip once.
+        seen = set()
+        for fbx_path in fbx_paths:
+            directory = os.path.dirname(fbx_path) or "."
+            for anim_path in sorted(glob.glob(os.path.join(directory, "*.anim"))):
+                if anim_path in seen:
+                    continue
+                seen.add(anim_path)
+                try:
+                    clip = unity_anim.load(anim_path)
+                except (OSError, ValueError) as ex:
+                    self.report({'ERROR'}, f"{os.path.basename(anim_path)}: {ex}")
+                    continue
+
+                action = None
+                last_error = None
+                for armature in imported_armatures:
+                    try:
+                        action, mapped_count, unresolved = unity_anim_action.import_clip(
+                            clip,
+                            armature,
+                            1.0,
+                            'IGNORE',
+                            'BIP001_PELVIS_HIPS',
+                            False,
+                            use_fake_user=self.anim_use_fake_user,
+                            name_collision_mode=self.anim_name_collision_mode,
+                        )
+                    except (OSError, ValueError) as ex:
+                        last_error = str(ex)
+                        continue
+                    if action is not None:
+                        message = (f"Imported {action.name} from {os.path.basename(anim_path)}: "
+                                   f"{mapped_count} paths mapped, {len(unresolved)} unresolved")
+                        warning = action.get("unity_humanoid_warning")
+                        if warning:
+                            message += f"; {warning}"
+                        self.report({'WARNING'} if warning else {'INFO'}, message)
+                        break
+                if action is None:
+                    if last_error:
+                        self.report({'ERROR'}, f"{os.path.basename(anim_path)}: {last_error}")
+                    else:
+                        self.report({'WARNING'}, f"Skipped {os.path.basename(anim_path)}: "
+                                  "an action with that name already exists")
 
 
 def import_panel_include(layout, operator):
@@ -318,6 +443,7 @@ def import_panel_materials(layout, operator):
     header, body = layout.panel("UNITY_FBX_import_material", default_closed=True)
     header.label(text="Materials")
     if body:
+        body.prop(operator, "material_preset")
         body.prop(operator, "mtl_name_collision_mode")
 
 
@@ -329,6 +455,11 @@ def import_panel_animation(layout, operator):
     if body:
         body.enabled = operator.use_anim
         body.prop(operator, "anim_offset")
+        body.prop(operator, "import_companion_anim")
+        sub = body.column()
+        sub.enabled = operator.import_companion_anim
+        sub.prop(operator, "anim_use_fake_user")
+        sub.prop(operator, "anim_name_collision_mode")
 
 
 def import_panel_armature(layout, operator):
@@ -353,6 +484,12 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".anim"
     filter_glob: StringProperty(default="*.anim", options={'HIDDEN'})
+
+    files: CollectionProperty(
+        name="File Path",
+        type=bpy.types.OperatorFileListElement,
+        options={'HIDDEN', 'SKIP_PRESET'},
+    )
 
     frame_start: FloatProperty(
         name="Start Frame",
@@ -396,35 +533,102 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         ),
         default='IGNORE',
     )
+    use_fake_user: BoolProperty(
+        name="Fake User",
+        description="Mark imported actions with a fake user so they are kept when the file is saved and reloaded",
+        default=True,
+    )
+    name_collision_mode: EnumProperty(
+        name="Name Collision",
+        description="Behavior when an imported action has the same name as an existing action",
+        items=(
+            (
+                "OVERWRITE",
+                "Overwrite",
+                "Replace the curves of the existing same-named action",
+            ),
+            (
+                "REUSE",
+                "Keep Existing",
+                "Skip importing clips whose action name already exists",
+            ),
+            (
+                "RENAME",
+                "Rename (Increment)",
+                "Import as a new action with an incremented .001 suffix",
+            ),
+        ),
+        default='OVERWRITE',
+    )
 
     @classmethod
     def poll(cls, context):
         return context.active_object is not None and context.active_object.type == 'ARMATURE'
 
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        layout.prop(self, "frame_start")
+        layout.prop(self, "humanoid_preset")
+        layout.prop(self, "use_bip001_avatar_calibration")
+        layout.prop(self, "root_motion")
+        layout.prop(self, "use_fake_user")
+        layout.prop(self, "name_collision_mode")
+
     def execute(self, context):
+        import os
         from . import unity_anim, unity_anim_action
 
         armature = context.active_object
-        try:
-            clip = unity_anim.load(self.filepath)
-            action, mapped_count, unresolved = unity_anim_action.import_clip(
-                clip,
-                armature,
-                self.frame_start,
-                self.root_motion,
-                self.humanoid_preset,
-                self.use_bip001_avatar_calibration,
-            )
-        except (OSError, ValueError) as ex:
-            self.report({'ERROR'}, str(ex))
-            return {'CANCELLED'}
 
-        message = f"Imported {action.name}: {mapped_count} paths mapped, {len(unresolved)} unresolved"
-        warning = action.get("unity_humanoid_warning")
-        if warning:
-            message += f"; {warning}"
-        self.report({'WARNING'} if warning else {'INFO'}, message)
-        return {'FINISHED'}
+        if self.files:
+            paths = [os.path.join(self.directory, file.name) for file in self.files]
+        else:
+            paths = [self.filepath]
+
+        ret = {'CANCELLED'}
+        imported = []
+        failed = []
+        skipped = []
+        for path in paths:
+            try:
+                clip = unity_anim.load(path)
+                action, mapped_count, unresolved = unity_anim_action.import_clip(
+                    clip,
+                    armature,
+                    self.frame_start,
+                    self.root_motion,
+                    self.humanoid_preset,
+                    self.use_bip001_avatar_calibration,
+                    use_fake_user=self.use_fake_user,
+                    name_collision_mode=self.name_collision_mode,
+                )
+            except (OSError, ValueError) as ex:
+                failed.append(f"{os.path.basename(path)}: {ex}")
+                continue
+
+            if action is None:
+                # Name collision with "Keep Existing": the existing action was kept as-is.
+                skipped.append(os.path.basename(path))
+                continue
+
+            ret = {'FINISHED'}
+            imported.append((action, mapped_count, unresolved))
+
+        for action, mapped_count, unresolved in imported:
+            message = f"Imported {action.name}: {mapped_count} paths mapped, {len(unresolved)} unresolved"
+            warning = action.get("unity_humanoid_warning")
+            if warning:
+                message += f"; {warning}"
+            self.report({'WARNING'} if warning else {'INFO'}, message)
+        for message in failed:
+            self.report({'ERROR'}, message)
+        for name in skipped:
+            self.report({'WARNING'}, f"Skipped {name}: an action with that name already exists")
+
+        return ret
 
 
 @orientation_helper(axis_forward='-Z', axis_up='Y')

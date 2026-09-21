@@ -2072,39 +2072,45 @@ def blen_read_material(fbx_tmpl, fbx_obj, settings):
                  elem_find_first(fbx_tmpl, b'Properties70', fbx_elem_nil))
     fbx_props_no_template = (fbx_props[0], fbx_elem_nil)
 
+    # FBX-driven principled BSDF sets all relevant parameters from FBX data and
+    # connects diffuse/normal/etc. textures; the other presets keep default
+    # shader parameters and only get the diffuse texture connected (see below).
+    from_fbx = settings.material_preset == 'PRINCIPLED'
+
     ma_wrap = node_shader_utils.PrincipledBSDFWrapper(ma, is_readonly=False)
-    ma_wrap.base_color = elem_props_get_color_rgb(fbx_props, b'DiffuseColor', const_color_white)
-    # No specular color in Principled BSDF shader, assumed to be either white or take some tint from diffuse one...
-    # TODO: add way to handle tint option (guesstimate from spec color + intensity...)?
-    ma_wrap.specular = elem_props_get_number(fbx_props, b'SpecularFactor', 0.25) * 2.0
-    # XXX Totally empirical conversion, trying to adapt it (and protect against invalid negative values, see T96076):
-    #     From [1.0 - 0.0] Principled BSDF range to [0.0 - 100.0] FBX shininess range)...
-    fbx_shininess = max(elem_props_get_number(fbx_props, b'Shininess', 20.0), 0.0)
-    ma_wrap.roughness = 1.0 - (sqrt(fbx_shininess) / 10.0)
-    # Sweetness... Looks like we are not the only ones to not know exactly how FBX is supposed to work (see T59850).
-    # According to one of its developers, Unity uses that formula to extract alpha value:
-    #
-    #   alpha = 1 - TransparencyFactor
-    #   if (alpha == 1 or alpha == 0):
-    #       alpha = 1 - TransparentColor.r
-    #
-    # Until further info, let's assume this is correct way to do, hence the following code for TransparentColor.
-    # However, there are some cases (from 3DSMax, see T65065), where we do have TransparencyFactor only defined
-    # in the template to 0.0, and then materials defining TransparentColor to pure white (1.0, 1.0, 1.0),
-    # and setting alpha value in Opacity... try to cope with that too. :((((
-    alpha = 1.0 - elem_props_get_number(fbx_props, b'TransparencyFactor', 0.0)
-    if (alpha == 1.0 or alpha == 0.0):
-        alpha = elem_props_get_number(fbx_props_no_template, b'Opacity', None)
-        if alpha is None:
-            alpha = 1.0 - elem_props_get_color_rgb(fbx_props, b'TransparentColor', const_color_black)[0]
-    ma_wrap.alpha = alpha
-    ma_wrap.metallic = elem_props_get_number(fbx_props, b'ReflectionFactor', 0.0)
-    # We have no metallic (a.k.a. reflection) color...
-    # elem_props_get_color_rgb(fbx_props, b'ReflectionColor', const_color_white)
-    ma_wrap.normalmap_strength = elem_props_get_number(fbx_props, b'BumpFactor', 1.0)
-    # Emission strength and color
-    ma_wrap.emission_strength = elem_props_get_number(fbx_props, b'EmissiveFactor', 1.0)
-    ma_wrap.emission_color = elem_props_get_color_rgb(fbx_props, b'EmissiveColor', const_color_black)
+    if from_fbx:
+        ma_wrap.base_color = elem_props_get_color_rgb(fbx_props, b'DiffuseColor', const_color_white)
+        # No specular color in Principled BSDF shader, assumed to be either white or take some tint from diffuse one...
+        # TODO: add way to handle tint option (guesstimate from spec color + intensity...)?
+        ma_wrap.specular = elem_props_get_number(fbx_props, b'SpecularFactor', 0.25) * 2.0
+        # XXX Totally empirical conversion, trying to adapt it (and protect against invalid negative values, see T96076):
+        #     From [1.0 - 0.0] Principled BSDF range to [0.0 - 100.0] FBX shininess range)...
+        fbx_shininess = max(elem_props_get_number(fbx_props, b'Shininess', 20.0), 0.0)
+        ma_wrap.roughness = 1.0 - (sqrt(fbx_shininess) / 10.0)
+        # Sweetness... Looks like we are not the only ones to not know exactly how FBX is supposed to work (see T59850).
+        # According to one of its developers, Unity uses that formula to extract alpha value:
+        #
+        #   alpha = 1 - TransparencyFactor
+        #   if (alpha == 1 or alpha == 0):
+        #       alpha = 1 - TransparentColor.r
+        #
+        # Until further info, let's assume this is correct way to do, hence the following code for TransparentColor.
+        # However, there are some cases (from 3DSMax, see T65065), where we do have TransparencyFactor only defined
+        # in the template to 0.0, and then materials defining TransparentColor to pure white (1.0, 1.0, 1.0),
+        # and setting alpha value in Opacity... try to cope with that too. :((((
+        alpha = 1.0 - elem_props_get_number(fbx_props, b'TransparencyFactor', 0.0)
+        if (alpha == 1.0 or alpha == 0.0):
+            alpha = elem_props_get_number(fbx_props_no_template, b'Opacity', None)
+            if alpha is None:
+                alpha = 1.0 - elem_props_get_color_rgb(fbx_props, b'TransparentColor', const_color_black)[0]
+        ma_wrap.alpha = alpha
+        ma_wrap.metallic = elem_props_get_number(fbx_props, b'ReflectionFactor', 0.0)
+        # We have no metallic (a.k.a. reflection) color...
+        # elem_props_get_color_rgb(fbx_props, b'ReflectionColor', const_color_white)
+        ma_wrap.normalmap_strength = elem_props_get_number(fbx_props, b'BumpFactor', 1.0)
+        # Emission strength and color
+        ma_wrap.emission_strength = elem_props_get_number(fbx_props, b'EmissiveFactor', 1.0)
+        ma_wrap.emission_color = elem_props_get_color_rgb(fbx_props, b'EmissiveColor', const_color_black)
 
     nodal_material_wrap_map[ma] = ma_wrap
 
@@ -3171,7 +3177,8 @@ def load(operator, context, filepath="",
          secondary_bone_axis='X',
          use_prepost_rot=True,
          colors_type='SRGB',
-         mtl_name_collision_mode="MAKE_UNIQUE"):
+         mtl_name_collision_mode="MAKE_UNIQUE",
+         material_preset='PRINCIPLED_DEFAULT'):
 
     global fbx_elem_nil
     fbx_elem_nil = FBXElem('', (), (), ())
@@ -3312,6 +3319,7 @@ def load(operator, context, filepath="",
         ignore_leaf_bones, force_connect_children, automatic_bone_orientation, bone_orientation_mode,
         bone_correction_matrix,
         use_prepost_rot, colors_type, mtl_name_collision_mode,
+        material_preset,
     )
 
     # #### And now, the "real" data.
@@ -4043,6 +4051,53 @@ def load(operator, context, filepath="",
             if clamp:
                 node_texture.extension = 'EXTEND'
 
+        # Images used as non-color data (normal maps etc.) must keep their default
+        # alpha handling; all other imported images get channel-packed alpha below.
+        noncolor_images = set()
+
+        material_preset = settings.material_preset
+        from_fbx = material_preset == 'PRINCIPLED'
+        # Next free row (in node-grid units) below the diffuse texture, per material.
+        parked_rows = {}
+        diffuse_bsdf_nodes = {}
+
+        def park_texture_node(material, image, noncolor, row):
+            """Add the image as an unconnected texture node, for manual wiring by the user."""
+            node = material.node_tree.nodes.new(type='ShaderNodeTexImage')
+            node.image = image
+            node.width = 280.0
+            if noncolor:
+                image.colorspace_settings.name = 'Non-Color'
+            # Diffuse at the top of a dedicated column to the left of the BSDF
+            # node; other textures stacked below it at the same spacing.
+            node.location = (-700.0, 100.0 - row * 300.0)
+            return node
+
+        def ensure_diffuse_bsdf(material, ma_wrap):
+            """Swap the default Principled BSDF for a Diffuse BSDF (DIFFUSE preset)."""
+            node_bsdf = diffuse_bsdf_nodes.get(material)
+            if node_bsdf is not None:
+                return node_bsdf
+            tree = material.node_tree
+            node_out = ma_wrap.node_out
+            node_principled = ma_wrap.node_principled_bsdf
+            location = ((node_principled.location.x, node_principled.location.y)
+                        if node_principled is not None else (0.0, 300.0))
+            if node_principled is not None:
+                tree.nodes.remove(node_principled)
+            node_bsdf = tree.nodes.new(type='ShaderNodeBsdfDiffuse')
+            node_bsdf.label = "Diffuse BSDF"
+            node_bsdf.location = location
+            tree.links.new(node_bsdf.outputs["BSDF"], node_out.inputs["Surface"])
+            diffuse_bsdf_nodes[material] = node_bsdf
+            return node_bsdf
+
+        def remove_principled_bsdf(material, ma_wrap):
+            """Remove the default Principled BSDF altogether (UNLIT preset)."""
+            node_principled = ma_wrap.node_principled_bsdf
+            if node_principled is not None:
+                material.node_tree.nodes.remove(node_principled)
+
         for fbx_uuid, fbx_item in fbx_table_nodes.items():
             fbx_obj, blen_data = fbx_item
             if fbx_obj.id != b'Material':
@@ -4058,63 +4113,102 @@ def load(operator, context, filepath="",
 
                     ma_wrap = nodal_material_wrap_map[material]
 
-                    if lnk_type in {b'DiffuseColor', b'3dsMax|maps|texmap_diffuse'}:
-                        ma_wrap.base_color_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.base_color_texture)
-                    elif lnk_type in {b'SpecularColor', b'SpecularFactor'}:
-                        # Intensity actually, not color...
-                        ma_wrap.specular_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.specular_texture)
-                    elif lnk_type in {b'ReflectionColor', b'ReflectionFactor', b'3dsMax|maps|texmap_reflection'}:
-                        # Intensity actually, not color...
-                        ma_wrap.metallic_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.metallic_texture)
-                    elif lnk_type in {b'TransparentColor', b'TransparencyFactor'}:
-                        ma_wrap.alpha_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.alpha_texture)
-                        if use_alpha_decals:
-                            material_decals.add(material)
-                    elif lnk_type == b'ShininessExponent':
-                        # That is probably reversed compared to expected results? TODO...
-                        ma_wrap.roughness_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.roughness_texture)
-                    # XXX, applications abuse bump!
+                    if from_fbx:
+                        if lnk_type in {b'DiffuseColor', b'3dsMax|maps|texmap_diffuse'}:
+                            ma_wrap.base_color_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.base_color_texture)
+                        elif lnk_type in {b'SpecularColor', b'SpecularFactor'}:
+                            # Intensity actually, not color...
+                            ma_wrap.specular_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.specular_texture)
+                        elif lnk_type in {b'ReflectionColor', b'ReflectionFactor', b'3dsMax|maps|texmap_reflection'}:
+                            # Intensity actually, not color...
+                            ma_wrap.metallic_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.metallic_texture)
+                        elif lnk_type in {b'TransparentColor', b'TransparencyFactor'}:
+                            ma_wrap.alpha_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.alpha_texture)
+                            if use_alpha_decals:
+                                material_decals.add(material)
+                        elif lnk_type == b'ShininessExponent':
+                            # That is probably reversed compared to expected results? TODO...
+                            ma_wrap.roughness_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.roughness_texture)
+                        # XXX, applications abuse bump!
+                        elif lnk_type in {b'NormalMap', b'Bump', b'3dsMax|maps|texmap_bump'}:
+                            ma_wrap.normalmap_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.normalmap_texture)
+                            # Non-color data, do not channel-pack its alpha.
+                            noncolor_images.add(image)
+                            """
+                        elif lnk_type == b'Bump':
+                            # TODO displacement...
+                            """
+                        elif lnk_type in {b'EmissiveColor'}:
+                            ma_wrap.emission_color_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.emission_color_texture)
+                        elif lnk_type in {b'EmissiveFactor'}:
+                            ma_wrap.emission_strength_texture.image = image
+                            texture_mapping_set(fbx_lnk, ma_wrap.emission_strength_texture)
+                        else:
+                            print("WARNING: material link %r ignored" % lnk_type)
+                    elif lnk_type in {b'DiffuseColor', b'3dsMax|maps|texmap_diffuse'}:
+                        # Connect the diffuse texture to the generated shader.
+                        if material_preset == 'UNLIT':
+                            tree = material.node_tree
+                            node_out = ma_wrap.node_out
+                            node_diffuse = park_texture_node(material, image, noncolor=False, row=0)
+                            tree.links.new(node_diffuse.outputs["Color"], node_out.inputs["Surface"])
+                            remove_principled_bsdf(material, ma_wrap)
+                        elif material_preset == 'DIFFUSE':
+                            node_bsdf = ensure_diffuse_bsdf(material, ma_wrap)
+                            node_diffuse = park_texture_node(material, image, noncolor=False, row=0)
+                            material.node_tree.links.new(
+                                node_diffuse.outputs["Color"], node_bsdf.inputs["Color"])
+                        else:  # PRINCIPLED_DEFAULT
+                            node_diffuse = park_texture_node(material, image, noncolor=False, row=0)
+                            material.node_tree.links.new(
+                                node_diffuse.outputs["Color"],
+                                ma_wrap.node_principled_bsdf.inputs["Base Color"])
                     elif lnk_type in {b'NormalMap', b'Bump', b'3dsMax|maps|texmap_bump'}:
-                        ma_wrap.normalmap_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.normalmap_texture)
-                        """
-                    elif lnk_type == b'Bump':
-                        # TODO displacement...
-                        """
-                    elif lnk_type in {b'EmissiveColor'}:
-                        ma_wrap.emission_color_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.emission_color_texture)
-                    elif lnk_type in {b'EmissiveFactor'}:
-                        ma_wrap.emission_strength_texture.image = image
-                        texture_mapping_set(fbx_lnk, ma_wrap.emission_strength_texture)
+                        # Non-color data, do not channel-pack its alpha.
+                        noncolor_images.add(image)
+                        row = parked_rows.get(material, 1)
+                        parked_rows[material] = row + 1
+                        park_texture_node(material, image, noncolor=True, row=row)
                     else:
-                        print("WARNING: material link %r ignored" % lnk_type)
+                        # Park any other imported texture without connecting it.
+                        row = parked_rows.get(material, 1)
+                        parked_rows[material] = row + 1
+                        park_texture_node(material, image, noncolor=False, row=row)
 
                     material_images.setdefault(material, {})[lnk_type] = image
+
+        # Treat alpha of all imported images as channel-packed (RGB and alpha
+        # holding independent data), except non-color data like normal maps.
+        for image in image_cache.values():
+            if image and image not in noncolor_images:
+                image.alpha_mode = 'CHANNEL_PACKED'
 
         # Check if the diffuse image has an alpha channel,
         # if so, use the alpha channel.
 
         # Note: this could be made optional since images may have alpha but be entirely opaque
-        for fbx_uuid, fbx_item in fbx_table_nodes.items():
-            fbx_obj, blen_data = fbx_item
-            if fbx_obj.id != b'Material':
-                continue
-            material = fbx_table_nodes.get(fbx_uuid, (None, None))[1]
-            image = material_images.get(material, {}).get(b'DiffuseColor', None)
-            # do we have alpha?
-            if image and image.depth == 32:
-                if use_alpha_decals:
-                    material_decals.add(material)
+        if from_fbx:
+            for fbx_uuid, fbx_item in fbx_table_nodes.items():
+                fbx_obj, blen_data = fbx_item
+                if fbx_obj.id != b'Material':
+                    continue
+                material = fbx_table_nodes.get(fbx_uuid, (None, None))[1]
+                image = material_images.get(material, {}).get(b'DiffuseColor', None)
+                # do we have alpha?
+                if image and image.depth == 32:
+                    if use_alpha_decals:
+                        material_decals.add(material)
 
-                ma_wrap = nodal_material_wrap_map[material]
-                ma_wrap.alpha_texture.use_alpha = True
-                ma_wrap.alpha_texture.copy_from(ma_wrap.base_color_texture)
+                    ma_wrap = nodal_material_wrap_map[material]
+                    ma_wrap.alpha_texture.use_alpha = True
+                    ma_wrap.alpha_texture.copy_from(ma_wrap.base_color_texture)
 
             # Propagate mapping from diffuse to all other channels which have none defined.
             # XXX Commenting for now, I do not really understand the logic here, why should diffuse mapping

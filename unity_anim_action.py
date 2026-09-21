@@ -604,7 +604,9 @@ def _write_matrix_channels(channelbag, target, matrices, frame_start, group_name
 def import_clip(
         clip, armature, frame_start=1.0, root_motion='IGNORE',
         humanoid_preset=DEFAULT_HUMANOID_PRESET,
-        use_bip001_avatar_calibration=False):
+        use_bip001_avatar_calibration=False,
+        use_fake_user=True,
+        name_collision_mode='OVERWRITE'):
     preset = HUMANOID_PRESETS.get(humanoid_preset)
     if preset is None:
         raise ValueError(f"Unknown Humanoid mapping preset: {humanoid_preset}")
@@ -711,9 +713,32 @@ def import_clip(
     if not mapped:
         raise ValueError("No Unity Transform or supported Humanoid curves matched the selected armature")
 
-    action = bpy.data.actions.new(clip.name)
-    slot = action.slots.new(armature.id_type, "Slot")
+    action = None
+    existing_action = bpy.data.actions.get(clip.name)
+    if existing_action is not None:
+        if name_collision_mode == 'REUSE':
+            # Keep the existing action as-is; the caller reports the skip.
+            return None, 0, []
+        if name_collision_mode == 'OVERWRITE':
+            # Reuse the same action and replace all of its curves below.
+            action = existing_action
+        # 'RENAME' falls through: bpy.data.actions.new() never overwrites,
+        # it renames the new action to clip.name + ".001" and so on.
+
+    if action is None:
+        action = bpy.data.actions.new(clip.name)
+    action.use_fake_user = bool(use_fake_user)
+
+    if not action.slots:
+        slot = action.slots.new(armature.id_type, "Slot")
+    else:
+        slot = action.slots[0]
     channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+    if existing_action is not None and name_collision_mode == 'OVERWRITE':
+        # Drop the previous curves of the reused action so the new ones do not
+        # stack on top of the old ones.
+        for fcurve in list(channelbag.fcurves):
+            channelbag.fcurves.remove(fcurve)
     animation_data = armature.animation_data_create()
     animation_data.action = action
     animation_data.action_slot = slot
