@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+import difflib
+import json
 import math
+import os
 import zlib
 
 import bpy
@@ -12,6 +15,157 @@ from .humanoid_biped_profile import (
     DEFAULT_HUMANOID_PRESET,
     HUMANOID_PRESETS,
 )
+
+
+# ---------------------------------------------------------------------------
+# .anim path remapping (unity_fbx_anim_importer anim_remap.json)
+#
+# Same-rig clip sets share one remap file next to the rig FBX: direct matches
+# are recorded as "auto", missing paths are left for the user to fix by hand,
+# and the importer rewrites clip paths through the table before resolving.
+# ---------------------------------------------------------------------------
+
+REMAP_FILE_NAME = "anim_remap.json"
+
+
+def remap_file_path(directory):
+    """Remap table path for a rig directory (next to the FBX / clips)."""
+    return os.path.join(directory or ".", REMAP_FILE_NAME)
+
+
+def load_remap_table(directory):
+    """Load the user-edited remap table for a rig directory.
+
+    Returns {anim path: blender path}. Entries mapping to None/"auto" are
+    resolved at load time: "auto" keeps the original path (direct match),
+    None means "leave unresolved" (the importer will report it).
+    """
+    path = remap_file_path(directory)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    # Accept both {"anim_path": "blender_path"} and the draft format
+    # {"mapping": {"anim_path": "blender_path"|null}} written by the scanner.
+    if isinstance(raw.get("mapping"), dict):
+        raw = raw["mapping"]
+    table = {}
+    for anim_path, blender_path in raw.items():
+        if not isinstance(anim_path, str):
+            continue
+        if blender_path == "auto":
+            table[anim_path] = anim_path
+        elif isinstance(blender_path, str) and blender_path:
+            table[anim_path] = blender_path
+        else:
+            table[anim_path] = None  # explicitly unmapped; keep to report
+    return table
+
+
+def _skeleton_path_map(armature):
+    """Map each armature bone to its full Blender hierarchy path."""
+    paths = {}
+    for bone in armature.data.bones:
+        names = []
+        current = bone
+        while current:
+            names.append(current.name)
+            current = current.parent
+        paths[bone.name] = "/".join(reversed(names))
+    return paths
+
+
+def _similar_candidates(anim_path, skeleton_paths, limit=8):
+    """Ranked Blender paths similar to an anim path, best first."""
+    leaf = anim_path.rsplit("/", 1)[-1]
+    scored = []
+    for bone_name, path in skeleton_paths.items():
+        ratio = difflib.SequenceMatcher(
+            None, anim_path.lower(), path.lower()).ratio()
+        leaf_ratio = difflib.SequenceMatcher(
+            None, leaf.lower(), bone_name.lower()).ratio()
+        scored.append((max(ratio, leaf_ratio), path))
+    scored.sort(reverse=True)
+    return [path for _score, path in scored[:limit]]
+
+
+def scan_remap_draft(anim_paths, armature, directory=None):
+    """Build a remap-table draft for the given clip paths.
+
+    Returns (mapping, report):
+      mapping: {anim path: "auto" | null} ready to dump as JSON. The user
+               replaces null values with Blender paths (or "auto" where the
+               scanner was wrong).
+      report:  per-path diagnostics for the scan log.
+    """
+    full_paths, suffix_paths = _bone_paths(armature)
+    skeleton_paths = _skeleton_path_map(armature)
+    existing = {}
+    if directory:
+        existing = load_remap_table(directory)
+        # Collapse resolved entries so re-scan keeps the user's choices.
+        existing = {k: v for k, v in existing.items() if v and v != "auto"}
+
+    mapping = {}
+    report = []
+    for anim_path in sorted(anim_paths):
+        if anim_path in existing:
+            mapping[anim_path] = existing[anim_path]
+            report.append((anim_path, "kept (user mapping)", existing[anim_path]))
+            continue
+        resolved = _resolve_bone(anim_path, full_paths, suffix_paths, armature)
+        if resolved:
+            mapping[anim_path] = "auto"
+            report.append((anim_path, "auto (direct match)", "auto"))
+            continue
+        candidates = _similar_candidates(anim_path, skeleton_paths)
+        mapping[anim_path] = None
+        report.append((anim_path, "UNRESOLVED", candidates))
+    return mapping, report
+
+
+def write_remap_draft(mapping, directory):
+    """Write the draft table next to the rig; returns the file path."""
+    path = remap_file_path(directory)
+    payload = {
+        "_comment": (
+            "anim path remap table: 'auto' = direct match kept as-is; "
+            "a Blender bone path = rewrite to that path; null = skip. "
+            "Shared by all clips of this rig."
+        ),
+        "mapping": mapping,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def apply_remap_table(anim_paths, table):
+    """Rewrite clip paths through a loaded table.
+
+    Returns (rewritten, skipped): rewritten maps anim path -> new path;
+    skipped lists paths the table left unmapped (null) so the importer
+    reports them as unresolved.
+    """
+    rewritten = {}
+    skipped = []
+    for anim_path in anim_paths:
+        new_path = table.get(anim_path)
+        if new_path is None and anim_path in table:
+            skipped.append(anim_path)
+            continue
+        if new_path:
+            rewritten[anim_path] = new_path
+        else:
+            # Not in the table at all: untouched, regular resolution.
+            rewritten[anim_path] = anim_path
+    return rewritten, skipped
+
 
 
 def _finite_slope(slope, fallback):
@@ -535,9 +689,25 @@ def _bip001_root_avatar_transform(muscle_curves, time, values_are_degrees):
     return position, rotation.normalized()
 
 
+def _neutralize_root_matrices(matrices):
+    """Remove the constant neutral offset of the body-root matrices.
+
+    Unity Humanoid RootT/RootQ place the Avatar body center at a constant
+    pedestal/display offset (e.g. UI_StandBy clips sit the character ~1.1 m up).
+    Subtracting the first-sample transform keeps only the dynamic motion, so the
+    character stands back at the rest pose while root animation stays intact.
+    """
+    if not matrices:
+        return matrices
+    base = matrices[0]
+    base_inverse = base.inverted_safe()
+    return [base_inverse @ matrix for matrix in matrices]
+
+
 def _root_motion_source_matrices(
         group, times, source_rest, muscle_curves=None,
-        values_are_degrees=False, calibrate_bip001_root=False):
+        values_are_degrees=False, calibrate_bip001_root=False,
+        neutralize_root=False):
     source_loc, source_rot, _source_scale = source_rest.decompose()
     unity_loc_default = (-source_loc.x, source_loc.y, source_loc.z)
     # RootQ/MotionQ are body-root rotations relative to the Avatar's neutral
@@ -570,6 +740,8 @@ def _root_motion_source_matrices(
         else:
             rotation = _unity_to_fbx_rotation(body_rotation) @ source_rot
         matrices.append(Matrix.LocRotScale(location, rotation, Vector((1.0, 1.0, 1.0))))
+    if neutralize_root:
+        matrices = _neutralize_root_matrices(matrices)
     return matrices
 
 
@@ -606,7 +778,9 @@ def import_clip(
         humanoid_preset=DEFAULT_HUMANOID_PRESET,
         use_bip001_avatar_calibration=False,
         use_fake_user=True,
-        name_collision_mode='OVERWRITE'):
+        name_collision_mode='OVERWRITE',
+        neutralize_root_offset=False,
+        remap_directory=None):
     preset = HUMANOID_PRESETS.get(humanoid_preset)
     if preset is None:
         raise ValueError(f"Unknown Humanoid mapping preset: {humanoid_preset}")
@@ -617,6 +791,24 @@ def import_clip(
 
     full_paths, suffix_paths = _bone_paths(armature)
     curve_groups = {}
+    remapped_from = {}
+    if remap_directory:
+        table = load_remap_table(remap_directory)
+        if table:
+            anim_paths = {curve.path for kind in (
+                'rotation', 'euler', 'position', 'scale')
+                for curves in (
+                    clip.rotation_curves, clip.euler_curves,
+                    clip.position_curves, clip.scale_curves)
+                for curve in curves}
+            rewritten, _skipped = apply_remap_table(anim_paths, table)
+            remapped_from = {v: k for k, v in rewritten.items() if k != v}
+            for kind, curves in (
+                    ('rotation', clip.rotation_curves), ('euler', clip.euler_curves),
+                    ('position', clip.position_curves), ('scale', clip.scale_curves)):
+                for curve in curves:
+                    if curve.path in rewritten and rewritten[curve.path] != curve.path:
+                        curve.path = rewritten[curve.path]
     for kind, curves in (
             ('rotation', clip.rotation_curves), ('euler', clip.euler_curves),
             ('position', clip.position_curves), ('scale', clip.scale_curves)):
@@ -776,7 +968,8 @@ def import_clip(
                 'rotation': rotation or {},
             }, times, root_source_rest, muscle_curves, muscle_values_are_degrees,
                 humanoid_count > 0 and has_humanoid_root
-                and use_bip001_avatar_calibration)
+                and use_bip001_avatar_calibration,
+                neutralize_root=neutralize_root_offset)
             root_source_initial_inv = root_source_matrices[0].inverted_safe()
             root_source_deltas = [matrix @ root_source_initial_inv for matrix in root_source_matrices]
 
@@ -806,7 +999,8 @@ def import_clip(
             humanoid_root_matrices = _root_motion_source_matrices(
                 curves['humanoid_root'], times, source_rest,
                 muscle_curves, muscle_values_are_degrees,
-                use_bip001_avatar_calibration)
+                use_bip001_avatar_calibration,
+                neutralize_root=neutralize_root_offset)
         previous_rotation = None
         channel_values = [[] for _ in range(10)]
 
@@ -884,6 +1078,7 @@ def import_clip(
     action["unity_unresolved_paths"] = unresolved
     action["unity_duplicate_paths"] = duplicate_paths
     action["unity_root_motion"] = root_motion
+    action["unity_neutralize_root_offset"] = bool(neutralize_root_offset)
     action["unity_humanoid_profile"] = preset["name"] if humanoid_count else ""
     action["unity_humanoid_preset"] = humanoid_preset if humanoid_count else ""
     action["unity_humanoid_hips_bone"] = humanoid_hips_bone if humanoid_hips_applied else ""

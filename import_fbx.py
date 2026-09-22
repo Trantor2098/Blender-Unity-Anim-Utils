@@ -2527,6 +2527,21 @@ class FbxImportHelperNode:
         self.has_bone_children = has_bone_children
         return self.is_bone or has_bone_children
 
+    def reassign_armatures_after_fake_bones(self):
+        """Second pass of armature ownership assignment.
+
+        find_armature_bones() (called from find_armatures()) stops recursing as
+        soon as a child is not a bone.  In mixed hierarchies like
+        "bone1"->"mesh1"->"bone2", find_fake_bones() later marks "mesh1" as a
+        (fake) bone, so the bones hanging below it never got their .armature
+        set.  Re-run the assignment from every armature node so the whole
+        chain gets it; for plain single-skeleton files this is a no-op.
+        """
+        if self.is_armature:
+            self.find_armature_bones(self)
+        for child in self.children:
+            child.reassign_armatures_after_fake_bones()
+
     def find_fake_bones(self, in_armature=False):
         if in_armature and not self.is_bone and self.has_bone_children:
             self.is_bone = True
@@ -3101,41 +3116,62 @@ def _bake_matrix_into_object_data(obj, matrix):
     return True
 
 
-def bake_imported_root_axis_conversion(root_helper, view_layer, report):
+def bake_imported_root_axis_conversion(root_helper, view_layer, report, bake_all=False):
     """Bake the FBX axis-conversion transform of imported root objects into their data.
 
     Unity FBX files are Y-up, so a 90 degree X rotation ends up on every imported root object.
     Baking it into the root's own data (and compensating its children) leaves the scene looking
     identical while the roots keep an identity transform.
-    """
-    skipped = []
-    for node in root_helper.children:
-        obj = node.bl_obj
-        if obj is None or obj.parent is not None:
-            continue
-        matrix = obj.matrix_basis.copy()
-        if matrix == Matrix():
-            continue
-        if obj.animation_data and obj.animation_data.action:
-            # The transform is driven by imported animation, clearing it would break the curves.
-            skipped.append(obj.name)
-            continue
-        if not _bake_matrix_into_object_data(obj, matrix):
-            skipped.append(obj.name)
-            continue
 
+    With ``bake_all`` the conversion is baked through the whole imported hierarchy
+    instead of the root objects only, so nested meshes do not keep a residual
+    local axis rotation that leaves the character visibly tilted.
+    """
+    def bake_object(obj, matrix):
+        """Bake `matrix` into `obj`; returns True when the object keeps an identity basis."""
+        if not _bake_matrix_into_object_data(obj, matrix):
+            return False
         if obj.type == 'ARMATURE':
             # Unity .anim curves remain in the original FBX skeleton space. Keep the
             # left-side conversion used to bake the root rest bones so the animation
             # importer can separate it from per-bone orientation corrections.
             obj["unity_fbx_baked_axis_matrix"] = tuple(value for row in matrix for value in row)
-
         obj.matrix_basis = Matrix()
+        return True
+
+    skipped = []
+
+    def collect_root_nodes(node):
+        roots = []
+        pending = [node]
+        while pending:
+            helper = pending.pop()
+            obj = helper.bl_obj
+            if obj is not None and (obj.parent is None or bake_all):
+                roots.append(helper)
+            pending.extend(helper.children)
+        return roots
+
+    for node in collect_root_nodes(root_helper):
+        obj = node.bl_obj
+        matrix = obj.matrix_basis.copy()
+        if matrix == Matrix():
+            # Still walk the children: they may carry a residual local conversion.
+            pass
+        elif obj.animation_data and obj.animation_data.action:
+            # The transform is driven by imported animation, clearing it would break the curves.
+            skipped.append(obj.name)
+            continue
+        elif not bake_object(obj, matrix):
+            skipped.append(obj.name)
+            continue
+
         for child in obj.children:
             if child.parent_type == 'BONE':
                 # Bone-parented children follow the rest pose that was just baked, so they need no fixup.
                 continue
-            child.matrix_parent_inverse = matrix @ child.matrix_parent_inverse
+            if not bake_all:
+                child.matrix_parent_inverse = matrix @ child.matrix_parent_inverse
 
             # Some Unity FBX meshes carry the inverse axis conversion locally, even
             # after the armature/root conversion has been baked. Move that remaining
@@ -3159,6 +3195,7 @@ def load(operator, context, filepath="",
          global_scale=1.0,
          bake_space_transform=False,
          bake_unity_axis=False,
+         bake_unity_axis_all=False,
          use_custom_normals=True,
          use_image_search=False,
          use_alpha_decals=False,
@@ -3569,6 +3606,13 @@ def load(operator, context, filepath="",
 
         # mark nodes that need a bone to attach child-bones to
         root_helper.find_fake_bones()
+
+        # Re-resolve armature ownership after fake bones were marked: find_armature_bones()
+        # above stopped at mixed-hierarchy nodes (e.g. "bone1"->"mesh1"->"bone2") because they
+        # were not bones yet, leaving .armature unset for the bone chains hanging below them.
+        # That made the later skinning pass store armature_setup[None] and link_hierarchy()
+        # raise KeyError.  Assigning again is a no-op for plain single-skeleton files.
+        root_helper.reassign_armatures_after_fake_bones()
 
         # mark leaf nodes that are only required to mark the end of their parent bone
         if settings.ignore_leaf_bones:
@@ -4252,7 +4296,9 @@ def load(operator, context, filepath="",
 
     if bake_unity_axis:
         perfmon.step("FBX import: Bake axis conversion...")
-        bake_imported_root_axis_conversion(fbx_helper_nodes[0], view_layer, operator.report)
+        bake_imported_root_axis_conversion(
+            fbx_helper_nodes[0], view_layer, operator.report,
+            bake_all=bake_unity_axis_all)
 
     if fbx_pose_mode != 'KEEP':
         perfmon.step("FBX import: Resolve default pose...")

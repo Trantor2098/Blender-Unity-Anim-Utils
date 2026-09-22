@@ -100,6 +100,13 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         "transform instead of a corrective 90 degree X rotation",
         default=True,
     )
+    bake_unity_axis_all: BoolProperty(
+        name="Bake Whole Hierarchy",
+        description="Bake the axis conversion through the whole imported hierarchy instead of the root "
+        "objects only, so nested meshes do not keep a residual local rotation that leaves "
+        "the character visibly tilted",
+        default=False,
+    )
 
     use_custom_normals: BoolProperty(
         name="Custom Normals",
@@ -164,6 +171,15 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
             ("RENAME", "Rename (Increment)", "Import as a new action with an incremented .001 suffix"),
         ),
         default='OVERWRITE',
+    )
+    anim_neutralize_root_offset: BoolProperty(
+        name="Neutralize Root Offset",
+        description=(
+            "Remove the constant neutral offset of the Unity body-root pose of companion "
+            "imported actions (RootT/RootQ pedestal or display offset); only the dynamic "
+            "root motion is kept"
+        ),
+        default=False,
     )
 
     use_subsurf: BoolProperty(
@@ -307,7 +323,8 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         keywords = self.as_keywords(
             ignore=("filter_glob", "directory", "ui_tab", "filepath", "files",
-                    "import_companion_anim", "anim_use_fake_user", "anim_name_collision_mode"),
+                    "import_companion_anim", "anim_use_fake_user", "anim_name_collision_mode",
+                    "anim_neutralize_root_offset"),
         )
         keywords["automatic_bone_orientation"] = self.bone_orientation_mode == 'BLENDER_AUTO'
 
@@ -379,6 +396,7 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
                             False,
                             use_fake_user=self.anim_use_fake_user,
                             name_collision_mode=self.anim_name_collision_mode,
+                            neutralize_root_offset=self.anim_neutralize_root_offset,
                         )
                     except (OSError, ValueError) as ex:
                         last_error = str(ex)
@@ -423,6 +441,9 @@ def import_panel_transform(layout, operator):
         row.prop(operator, "bake_space_transform")
         row.label(text="", icon='ERROR')
         body.prop(operator, "bake_unity_axis")
+        sub = body.column()
+        sub.enabled = operator.bake_unity_axis
+        sub.prop(operator, "bake_unity_axis_all")
         body.prop(operator, "use_prepost_rot")
 
         import_panel_transform_orientation(body, operator)
@@ -460,6 +481,7 @@ def import_panel_animation(layout, operator):
         sub.enabled = operator.import_companion_anim
         sub.prop(operator, "anim_use_fake_user")
         sub.prop(operator, "anim_name_collision_mode")
+        sub.prop(operator, "anim_neutralize_root_offset")
 
 
 def import_panel_armature(layout, operator):
@@ -481,6 +503,13 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
     bl_idname = "import_anim.unity_anim"
     bl_label = "Import Unity Animation Clip"
     bl_options = {'UNDO'}
+
+    # ImportHelper does not provide a `directory` property; without it the
+    # fileselect would hand us a bare filename and os.path.join() would fail.
+    directory: StringProperty(
+        subtype='DIR_PATH',
+        options={'HIDDEN', 'SKIP_PRESET'},
+    )
 
     filename_ext = ".anim"
     filter_glob: StringProperty(default="*.anim", options={'HIDDEN'})
@@ -520,6 +549,15 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         ),
         default=False,
     )
+    neutralize_root_offset: BoolProperty(
+        name="Neutralize Root Offset",
+        description=(
+            "Remove the constant neutral offset of the Unity body-root pose "
+            "(RootT/RootQ pedestal or display offset, e.g. UI standby clips "
+            "sitting ~1 m up); only the dynamic root motion is kept"
+        ),
+        default=False,
+    )
     root_motion: EnumProperty(
         name="Root Motion",
         items=(
@@ -537,6 +575,16 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         name="Fake User",
         description="Mark imported actions with a fake user so they are kept when the file is saved and reloaded",
         default=True,
+    )
+    remap_directory: StringProperty(
+        name="Remap Directory",
+        description=(
+            "Directory of the remap table (anim_remap.json) shared by all "
+            "clips of this rig; direct-matched paths are kept, the rest are "
+            "rewritten through the table. Empty = no remapping"
+        ),
+        subtype='DIR_PATH',
+        default="",
     )
     name_collision_mode: EnumProperty(
         name="Name Collision",
@@ -573,9 +621,11 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         layout.prop(self, "frame_start")
         layout.prop(self, "humanoid_preset")
         layout.prop(self, "use_bip001_avatar_calibration")
+        layout.prop(self, "neutralize_root_offset")
         layout.prop(self, "root_motion")
         layout.prop(self, "use_fake_user")
         layout.prop(self, "name_collision_mode")
+        layout.prop(self, "remap_directory")
 
     def execute(self, context):
         import os
@@ -604,6 +654,8 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
                     self.use_bip001_avatar_calibration,
                     use_fake_user=self.use_fake_user,
                     name_collision_mode=self.name_collision_mode,
+                    neutralize_root_offset=self.neutralize_root_offset,
+                    remap_directory=self.remap_directory or None,
                 )
             except (OSError, ValueError) as ex:
                 failed.append(f"{os.path.basename(path)}: {ex}")
@@ -629,6 +681,71 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
             self.report({'WARNING'}, f"Skipped {name}: an action with that name already exists")
 
         return ret
+
+
+class UNITY_FBX_OT_scan_anim_remap(bpy.types.Operator, ImportHelper):
+    """Generate an anim path remap table draft (anim_remap.json) for the selected clips"""
+    bl_idname = "import_scene.unity_fbx_scan_anim_remap"
+    bl_label = "Scan Anim Remap Table (Draft)"
+    bl_options = {'UNDO'}
+
+    filename_ext = ".anim"
+    filter_glob: StringProperty(default="*.anim", options={'HIDDEN'})
+
+    directory: StringProperty(
+        subtype='DIR_PATH',
+        options={'HIDDEN', 'SKIP_PRESET'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == 'ARMATURE'
+
+    def execute(self, context):
+        import glob
+        import os
+        from . import unity_anim, unity_anim_action
+
+        armature = context.active_object
+        directory = os.path.dirname(self.filepath) or self.directory or "."
+
+        # Collect paths from every clip in the directory (shared table).
+        clip_paths = sorted(glob.glob(os.path.join(directory, "*.anim")))
+        anim_paths = set()
+        for path in clip_paths:
+            try:
+                clip = unity_anim.load(path)
+            except (OSError, ValueError):
+                continue
+            anim_paths.update(curve.path for curves in (
+                clip.rotation_curves, clip.euler_curves,
+                clip.position_curves, clip.scale_curves) for curve in curves)
+        if not anim_paths:
+            self.report({'WARNING'}, "No .anim clip paths found in " + directory)
+            return {'CANCELLED'}
+
+        mapping, report = unity_anim_action.scan_remap_draft(
+            anim_paths, armature, directory)
+        out_path = unity_anim_action.write_remap_draft(mapping, directory)
+
+        auto_count = sum(1 for v in mapping.values() if v == "auto")
+        user_count = sum(1 for v in mapping.values() if v and v != "auto")
+        unresolved_count = sum(1 for v in mapping.values() if not v)
+        lines = [
+            f"Wrote {out_path}",
+            f"{len(anim_paths)} clip paths: "
+            f"{auto_count} auto, {user_count} kept from previous table, "
+            f"{unresolved_count} unresolved (null)",
+            "Unresolved candidates (best first):",
+        ]
+        for path, status, detail in report:
+            if status == "UNRESOLVED":
+                candidates = detail
+                lines.append(f"  {path}")
+                if candidates:
+                    lines.append("    -> " + " | ".join(candidates[:4]))
+        self.report({'WARNING'}, "\n".join(lines))
+        return {'FINISHED'}
 
 
 @orientation_helper(axis_forward='-Z', axis_up='Y')
@@ -1038,13 +1155,16 @@ def export_panel_animation(layout, operator):
 def menu_func_import(self, context):
     self.layout.operator(ImportFBX.bl_idname, text="Unity FBX (.fbx)")
     self.layout.operator(ImportUnityAnim.bl_idname, text="Unity Animation Clip (.anim)")
+    self.layout.operator(
+        UNITY_FBX_OT_scan_anim_remap.bl_idname,
+        text="Scan Unity Anim Remap Table (draft anim_remap.json)")
 
 
 def menu_func_export(self, context):
     self.layout.operator(ExportFBX.bl_idname, text="FBX (.fbx)")
 
 
-classes = (ImportFBX, ImportUnityAnim)
+classes = (ImportFBX, ImportUnityAnim, UNITY_FBX_OT_scan_anim_remap)
 
 
 def register():
