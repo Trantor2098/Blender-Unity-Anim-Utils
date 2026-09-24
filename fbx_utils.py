@@ -1941,4 +1941,5 @@ FBXImportSettings = namedtuple("FBXImportSettings", (
     "ignore_leaf_bones", "force_connect_children", "automatic_bone_orientation", "bone_orientation_mode",
     "bone_correction_matrix",
     "use_prepost_rot", "colors_type", "mtl_name_collision_mode", "material_preset",
+    "skin_bind_mode",
 ))

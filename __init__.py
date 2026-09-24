@@ -241,6 +241,27 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         ),
         default='KEEP',
     )
+    skin_bind_mode: EnumProperty(
+        name="Skin Bind",
+        description="How skinned-mesh bind data interacts with the mesh node transform. "
+                    "Unity bakes the node transform into the skin bind matrices and then ignores it at "
+                    "runtime, which offsets skinned meshes in Blender when the node transform is not identity",
+        items=(
+            (
+                'UNITY',
+                "Strip Node Transform (Unity)",
+                "Strip the mesh node transform from the skin bind matrices, matching Unity runtime "
+                "placement (fixes skinned meshes drifting away from the body)",
+            ),
+            (
+                'FBX',
+                "Keep Bind Data (FBX)",
+                "Use the FBX bind matrices as-is, matching what other FBX importers do "
+                "(skinned meshes follow their node transform)",
+            ),
+        ),
+        default='UNITY',
+    )
     primary_bone_axis: EnumProperty(
         name="Primary Bone Axis",
         items=(('X', "X Axis", ""),
@@ -492,6 +513,7 @@ def import_panel_armature(layout, operator):
         body.prop(operator, "force_connect_children"),
         body.prop(operator, "bone_orientation_mode")
         body.prop(operator, "fbx_pose_mode")
+        body.prop(operator, "skin_bind_mode")
         sub = body.column()
         sub.enabled = operator.bone_orientation_mode == 'ORIGINAL'
         sub.prop(operator, "primary_bone_axis")

@@ -3215,7 +3215,8 @@ def load(operator, context, filepath="",
          use_prepost_rot=True,
          colors_type='SRGB',
          mtl_name_collision_mode="MAKE_UNIQUE",
-         material_preset='PRINCIPLED_DEFAULT'):
+         material_preset='PRINCIPLED_DEFAULT',
+         skin_bind_mode='UNITY'):
 
     global fbx_elem_nil
     fbx_elem_nil = FBXElem('', (), (), ())
@@ -3357,6 +3358,7 @@ def load(operator, context, filepath="",
         bone_correction_matrix,
         use_prepost_rot, colors_type, mtl_name_collision_mode,
         material_preset,
+        skin_bind_mode,
     )
 
     # #### And now, the "real" data.
@@ -3669,6 +3671,54 @@ def load(operator, context, filepath="",
                 armature_matrix = tx_arm
 
                 if tx_bone:
+                    # Unity exports skinned meshes with the mesh node's own transform
+                    # baked into every TransformLink/Transform of its skin clusters
+                    # (the SkinnedMeshRenderer ignores the node transform at runtime,
+                    # so the offset only lives in the bind data).  Blender uses those
+                    # matrices as the bone rest pose and mesh bind matrix, which makes
+                    # skinned meshes whose node carries a non-identity transform (e.g.
+                    # a Lcl Translation) drift away from the rest of the body.
+                    # Strip the mesh node's global transform back out of the cluster
+                    # matrices so the skin binds in the node's own (identity) space.
+                    node_global = None
+                    if settings.skin_bind_mode == 'UNITY':
+                        for skin_uuid, skin_link in fbx_connection_map.get(cluster_uuid, ()):
+                            if skin_link.props[0] != b'OO':
+                                continue
+                            fbx_skin, _ = fbx_table_nodes.get(skin_uuid, (None, None))
+                            if (fbx_skin is None or fbx_skin.id != b'Deformer'
+                                    or fbx_skin.props[2] != b'Skin'):
+                                continue
+                            for geo_uuid, geo_link in fbx_connection_map.get(skin_uuid, ()):
+                                if geo_link.props[0] != b'OO':
+                                    continue
+                                fbx_mesh, _ = fbx_table_nodes.get(geo_uuid, (None, None))
+                                if (fbx_mesh is None or fbx_mesh.id != b'Geometry'
+                                        or fbx_mesh.props[2] != b'Mesh'):
+                                    continue
+                                for object_uuid, object_link in fbx_connection_map.get(geo_uuid, ()):
+                                    if object_link.props[0] != b'OO':
+                                        continue
+                                    mesh_node = fbx_helper_nodes.get(object_uuid)
+                                    if mesh_node is not None:
+                                        node_global = mesh_node.get_world_matrix()
+                                        break
+                                if node_global is not None:
+                                    break
+
+                    if node_global is not None and not node_global.is_identity:
+                        # The node transform is baked into TransformLink/AssociateModel
+                        # (bone/bind side) but NOT into Transform, which is already
+                        # relative (TL^-1 @ meshGlobal, node-free).  Strip it from the
+                        # bone-side matrices only, so the mesh binds where Unity puts
+                        # it: TL' @ Transform = node-free meshGlobal.
+                        strip = node_global.inverted_safe()
+                        tx_bone = strip @ tx_bone
+                        if tx_arm is not None:
+                            tx_arm = strip @ tx_arm
+
+                    mesh_matrix = tx_mesh
+                    armature_matrix = tx_arm
                     mesh_matrix = tx_bone @ mesh_matrix
                     helper_node.bind_matrix = tx_bone  # overwrite the bind matrix
 
