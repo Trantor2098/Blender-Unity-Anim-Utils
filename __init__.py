@@ -5,9 +5,9 @@
 bl_info = {
     "name": "Unity FBX & Animation Importer",
     "author": "Blender Foundation, Unity FBX contributors",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 0, 0),
-    "location": "File > Import-Export",
+    "location": "File > Import-Export; 3D Viewport > Sidebar > Unity Utils",
     "description": "Import Unity-oriented FBX files and Unity AnimationClip assets",
     "warning": "",
     "doc_url": "",
@@ -28,6 +28,8 @@ if "bpy" in locals():
         importlib.reload(unity_anim)
     if "unity_anim_action" in locals():
         importlib.reload(unity_anim_action)
+    if "bone_collections" in locals():
+        importlib.reload(bone_collections)
 
 
 import bpy
@@ -35,8 +37,10 @@ from bpy.props import (
     StringProperty,
     BoolProperty,
     FloatProperty,
+    FloatVectorProperty,
     EnumProperty,
     CollectionProperty,
+    PointerProperty,
 )
 from bpy_extras.io_utils import (
     ImportHelper,
@@ -262,6 +266,18 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         ),
         default='UNITY',
     )
+    import_bip_collections: BoolProperty(
+        name="Bip/Non-Bip Bone Collections",
+        description="After import, assign Bip-named bones (Bip001 ...) to a 'Bip' bone collection "
+                    "and the remaining bones to a 'Non-Bip' bone collection",
+        default=True,
+    )
+    import_stick_display: BoolProperty(
+        name="Stick Display In Front",
+        description="After import, set the armature display to Stick and enable In Front "
+                    "for the imported armatures",
+        default=True,
+    )
     primary_bone_axis: EnumProperty(
         name="Primary Bone Axis",
         items=(('X', "X Axis", ""),
@@ -345,7 +361,8 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
         keywords = self.as_keywords(
             ignore=("filter_glob", "directory", "ui_tab", "filepath", "files",
                     "import_companion_anim", "anim_use_fake_user", "anim_name_collision_mode",
-                    "anim_neutralize_root_offset"),
+                    "anim_neutralize_root_offset",
+                    "import_bip_collections", "import_stick_display"),
         )
         keywords["automatic_bone_orientation"] = self.bone_orientation_mode == 'BLENDER_AUTO'
 
@@ -368,11 +385,32 @@ class ImportFBX(bpy.types.Operator, ImportHelper):
                 ret = {'FINISHED'}
                 imported_fbx.append(path)
 
+        if self.import_bip_collections or self.import_stick_display:
+            self._post_import_armatures(
+                context, armature_names_before,
+                use_bip_collections=self.import_bip_collections,
+                use_stick_display=self.import_stick_display)
+
         if self.import_companion_anim:
             self._import_companion_animations(
                 context, imported_fbx, armature_names_before)
 
         return ret
+
+    def _post_import_armatures(self, context, armature_names_before,
+                               use_bip_collections=True, use_stick_display=True):
+        """Apply bone collection and display options to the freshly imported armatures."""
+        from . import bone_collections
+
+        imported_armatures = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'ARMATURE' and obj.name not in armature_names_before
+        ]
+        for arm_obj in imported_armatures:
+            if use_bip_collections:
+                bone_collections.split_bip_collections(arm_obj)
+            if use_stick_display:
+                bone_collections.apply_stick_display(arm_obj)
 
     def _import_companion_animations(self, context, fbx_paths, armature_names_before):
         """Import the Unity .anim clips found next to the imported FBX files."""
@@ -514,6 +552,8 @@ def import_panel_armature(layout, operator):
         body.prop(operator, "bone_orientation_mode")
         body.prop(operator, "fbx_pose_mode")
         body.prop(operator, "skin_bind_mode")
+        body.prop(operator, "import_bip_collections")
+        body.prop(operator, "import_stick_display")
         sub = body.column()
         sub.enabled = operator.bone_orientation_mode == 'ORIGINAL'
         sub.prop(operator, "primary_bone_axis")
@@ -598,16 +638,6 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         description="Mark imported actions with a fake user so they are kept when the file is saved and reloaded",
         default=True,
     )
-    remap_directory: StringProperty(
-        name="Remap Directory",
-        description=(
-            "Directory of the remap table (anim_remap.json) shared by all "
-            "clips of this rig; direct-matched paths are kept, the rest are "
-            "rewritten through the table. Empty = no remapping"
-        ),
-        subtype='DIR_PATH',
-        default="",
-    )
     name_collision_mode: EnumProperty(
         name="Name Collision",
         description="Behavior when an imported action has the same name as an existing action",
@@ -630,6 +660,25 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         ),
         default='OVERWRITE',
     )
+    use_bone_collection_filter: BoolProperty(
+        name="Limit to Bone Collection",
+        description="Only import the curves of the bones in the chosen bone collection "
+                    "(its child collections included); the other bones keep their "
+                    "current animation",
+        default=False,
+    )
+    bone_collection_filter: StringProperty(
+        name="Bone Collection",
+        description="Bone collection to restrict the imported curves to",
+        default="",
+    )
+    patch_current_action: BoolProperty(
+        name="Patch Current Action",
+        description="With a bone collection filter, write the curves into the action "
+                    "currently animating the armature instead of switching to a new "
+                    "clip-named action (outside-collection bones keep their animation)",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -647,7 +696,17 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         layout.prop(self, "root_motion")
         layout.prop(self, "use_fake_user")
         layout.prop(self, "name_collision_mode")
-        layout.prop(self, "remap_directory")
+        layout.separator()
+        layout.use_property_split = False
+        layout.prop(self, "use_bone_collection_filter")
+        sub = layout.column()
+        sub.enabled = self.use_bone_collection_filter
+        sub.use_property_split = True
+        # Offer the collections of the active armature as a dropdown.
+        armature = context.active_object
+        sub.prop_search(self, "bone_collection_filter", armature.data, "collections",
+                        text="Bone Collection", icon='GROUP_BONE')
+        sub.prop(self, "patch_current_action")
 
     def execute(self, context):
         import os
@@ -664,6 +723,13 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
         imported = []
         failed = []
         skipped = []
+        bone_collection_filter = None
+        if self.use_bone_collection_filter and self.bone_collection_filter:
+            bone_collection_filter = self.bone_collection_filter
+            if bone_collection_filter not in armature.data.collections:
+                self.report({'ERROR'},
+                            f"Bone collection not found: {bone_collection_filter}")
+                return {'CANCELLED'}
         for path in paths:
             try:
                 clip = unity_anim.load(path)
@@ -677,7 +743,8 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
                     use_fake_user=self.use_fake_user,
                     name_collision_mode=self.name_collision_mode,
                     neutralize_root_offset=self.neutralize_root_offset,
-                    remap_directory=self.remap_directory or None,
+                    bone_collection_filter=bone_collection_filter,
+                    patch_current_action=self.patch_current_action,
                 )
             except (OSError, ValueError) as ex:
                 failed.append(f"{os.path.basename(path)}: {ex}")
@@ -693,6 +760,9 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
 
         for action, mapped_count, unresolved in imported:
             message = f"Imported {action.name}: {mapped_count} paths mapped, {len(unresolved)} unresolved"
+            filtered_out = action.get("unity_filtered_out_paths")
+            if filtered_out:
+                message += f", {len(filtered_out)} filtered out by bone collection"
             warning = action.get("unity_humanoid_warning")
             if warning:
                 message += f"; {warning}"
@@ -703,71 +773,6 @@ class ImportUnityAnim(bpy.types.Operator, ImportHelper):
             self.report({'WARNING'}, f"Skipped {name}: an action with that name already exists")
 
         return ret
-
-
-class UNITY_FBX_OT_scan_anim_remap(bpy.types.Operator, ImportHelper):
-    """Generate an anim path remap table draft (anim_remap.json) for the selected clips"""
-    bl_idname = "import_scene.unity_fbx_scan_anim_remap"
-    bl_label = "Scan Anim Remap Table (Draft)"
-    bl_options = {'UNDO'}
-
-    filename_ext = ".anim"
-    filter_glob: StringProperty(default="*.anim", options={'HIDDEN'})
-
-    directory: StringProperty(
-        subtype='DIR_PATH',
-        options={'HIDDEN', 'SKIP_PRESET'},
-    )
-
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'ARMATURE'
-
-    def execute(self, context):
-        import glob
-        import os
-        from . import unity_anim, unity_anim_action
-
-        armature = context.active_object
-        directory = os.path.dirname(self.filepath) or self.directory or "."
-
-        # Collect paths from every clip in the directory (shared table).
-        clip_paths = sorted(glob.glob(os.path.join(directory, "*.anim")))
-        anim_paths = set()
-        for path in clip_paths:
-            try:
-                clip = unity_anim.load(path)
-            except (OSError, ValueError):
-                continue
-            anim_paths.update(curve.path for curves in (
-                clip.rotation_curves, clip.euler_curves,
-                clip.position_curves, clip.scale_curves) for curve in curves)
-        if not anim_paths:
-            self.report({'WARNING'}, "No .anim clip paths found in " + directory)
-            return {'CANCELLED'}
-
-        mapping, report = unity_anim_action.scan_remap_draft(
-            anim_paths, armature, directory)
-        out_path = unity_anim_action.write_remap_draft(mapping, directory)
-
-        auto_count = sum(1 for v in mapping.values() if v == "auto")
-        user_count = sum(1 for v in mapping.values() if v and v != "auto")
-        unresolved_count = sum(1 for v in mapping.values() if not v)
-        lines = [
-            f"Wrote {out_path}",
-            f"{len(anim_paths)} clip paths: "
-            f"{auto_count} auto, {user_count} kept from previous table, "
-            f"{unresolved_count} unresolved (null)",
-            "Unresolved candidates (best first):",
-        ]
-        for path, status, detail in report:
-            if status == "UNRESOLVED":
-                candidates = detail
-                lines.append(f"  {path}")
-                if candidates:
-                    lines.append("    -> " + " | ".join(candidates[:4]))
-        self.report({'WARNING'}, "\n".join(lines))
-        return {'FINISHED'}
 
 
 @orientation_helper(axis_forward='-Z', axis_up='Y')
@@ -1174,30 +1179,323 @@ def export_panel_animation(layout, operator):
         body.prop(operator, "bake_anim_simplify_factor")
 
 
+def _merge_collection_items(self, context):
+    """Bone collections of the active armature for the merge multi-select enum."""
+    items = []
+    obj = getattr(context, "active_object", None) if context else None
+    if obj is not None and getattr(obj, "type", None) == 'ARMATURE':
+        for collection in obj.data.collections:
+            items.append((collection.name, collection.name, ""))
+    if not items:
+        # ENUM_FLAG properties need at least one item to register.
+        items.append(("__none__", "No Collections", ""))
+    return items
+
+
+PALETTE_ITEMS = (
+    ('DEFAULT', "Default", "Default theme color"),
+    ('THEME01', "Theme 01", ""), ('THEME02', "Theme 02", ""),
+    ('THEME03', "Theme 03", ""), ('THEME04', "Theme 04", ""),
+    ('THEME05', "Theme 05", ""), ('THEME06', "Theme 06", ""),
+    ('THEME07', "Theme 07", ""), ('THEME08', "Theme 08", ""),
+    ('THEME09', "Theme 09", ""), ('THEME10', "Theme 10", ""),
+    ('THEME11', "Theme 11", ""), ('THEME12', "Theme 12", ""),
+    ('THEME13', "Theme 13", ""), ('THEME14', "Theme 14", ""),
+    ('THEME15', "Theme 15", ""), ('THEME16', "Theme 16", ""),
+    ('THEME17', "Theme 17", ""), ('THEME18', "Theme 18", ""),
+    ('THEME19', "Theme 19", ""), ('THEME20', "Theme 20", ""),
+    ('CUSTOM', "Custom", "Custom RGB color"),
+)
+
+
+class UNITY_FBX_OT_bone_collection_from_name(bpy.types.Operator):
+    """Collect the bones whose name contains the given string into a bone collection"""
+    bl_idname = "unity_fbx.bone_collection_from_name"
+    bl_label = "Create Bone Collection From Name"
+    bl_options = {'UNDO', 'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'ARMATURE'
+
+    def execute(self, context):
+        from . import bone_collections
+
+        settings = context.scene.unity_fbx_anim_utils
+        arm_obj = context.active_object
+        arm = arm_obj.data
+
+        bone_names = bone_collections.collect_matching_bones(arm, settings.match_string)
+        if not bone_names:
+            self.report({'WARNING'}, f"No bone contains {settings.match_string!r}")
+            return {'CANCELLED'}
+
+        coll = bone_collections.get_or_create_collection(arm, settings.collection_name)
+        bone_collections.move_bones_to_collection(arm, coll, bone_names)
+
+        for name in bone_names:
+            bone = arm.bones[name]
+            if settings.use_bone_color:
+                if settings.bone_color_mode == 'CUSTOM':
+                    bone_collections.set_bone_color(bone, 'CUSTOM', settings.custom_color)
+                else:
+                    bone_collections.set_bone_color(bone, settings.bone_color_palette)
+
+        if settings.set_display_as:
+            # Display As is an armature-data setting in Blender.
+            arm.display_type = settings.display_as
+            arm.show_bone_colors = True
+
+        self.report({'INFO'}, f"{coll.name}: {len(bone_names)} bones")
+        return {'FINISHED'}
+
+
 def menu_func_import(self, context):
     self.layout.operator(ImportFBX.bl_idname, text="Unity FBX (.fbx)")
     self.layout.operator(ImportUnityAnim.bl_idname, text="Unity Animation Clip (.anim)")
-    self.layout.operator(
-        UNITY_FBX_OT_scan_anim_remap.bl_idname,
-        text="Scan Unity Anim Remap Table (draft anim_remap.json)")
 
 
 def menu_func_export(self, context):
     self.layout.operator(ExportFBX.bl_idname, text="FBX (.fbx)")
 
 
-classes = (ImportFBX, ImportUnityAnim, UNITY_FBX_OT_scan_anim_remap)
+class UNITY_FBX_OT_merge_actions_by_collection(bpy.types.Operator):
+    """Override the base action with the override action's curves of the selected bone collections"""
+    bl_idname = "unity_fbx.merge_actions_by_collection"
+    bl_label = "Override Base Action By Collection"
+    bl_options = {'UNDO', 'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'ARMATURE'
+
+    def execute(self, context):
+        from . import unity_anim_action
+
+        settings = context.scene.unity_fbx_anim_utils
+        armature = context.active_object
+
+        base = settings.merge_base_action
+        override = settings.merge_override_action
+        if base is None or override is None:
+            self.report({'ERROR'}, "Select a base and an override action")
+            return {'CANCELLED'}
+        if base == override:
+            self.report({'ERROR'}, "Base and override actions must differ")
+            return {'CANCELLED'}
+        collections = sorted(settings.merge_collections)
+        if not collections:
+            self.report({'ERROR'}, "Select at least one bone collection")
+            return {'CANCELLED'}
+
+        try:
+            action, merged, skipped = unity_anim_action.merge_actions_by_collection(
+                armature, [override], base.name,
+                collections, use_fake_user=settings.merge_use_fake_user)
+        except (OSError, ValueError) as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+
+        message = (f"{override.name} -> {action.name}: {merged} fcurves overridden"
+                   f" within {', '.join(collections)}, {skipped} kept/skipped")
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+# --- 3D Viewport GUI Panel -------------------------------------------------
+
+class UnityFBXAnimUtilsSettings(bpy.types.PropertyGroup):
+    """Settings for the Anim Utils bone collection operator."""
+    match_string: StringProperty(
+        name="Match",
+        description="Bones whose name contains this string are collected",
+        default="Bip",
+    )
+    collection_name: StringProperty(
+        name="Collection",
+        description="Name of the bone collection to create or reuse",
+        default="Bip",
+    )
+    use_bone_color: BoolProperty(
+        name="Set Bone Color",
+        description="Set the bone color of the collected bones",
+        default=True,
+    )
+    bone_color_mode: EnumProperty(
+        name="Color",
+        description="Bone color source",
+        items=(
+            ('PALETTE', "Theme Palette", "Use a theme palette color"),
+            ('CUSTOM', "Custom", "Use a custom RGB color"),
+        ),
+        default='PALETTE',
+    )
+    bone_color_palette: EnumProperty(
+        name="Palette",
+        description="Theme palette color",
+        items=PALETTE_ITEMS,
+        default='THEME01',
+    )
+    custom_color: FloatVectorProperty(
+        name="Custom Color",
+        description="Custom bone color",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(1.0, 0.3, 0.0, 1.0),
+    )
+    set_display_as: BoolProperty(
+        name="Set Display As",
+        description="Set the display style of the collected bones",
+        default=False,
+    )
+    display_as: EnumProperty(
+        name="Display As",
+        description="Bone display style in the viewport",
+        items=(
+            ('OCTAHEDRAL', "Octahedral", ""),
+            ('STICK', "Stick", ""),
+            ('BBONE', "B-Bone", ""),
+            ('ENVELOPE', "Envelope", ""),
+            ('WIRE', "Wire", ""),
+        ),
+        default='STICK',
+    )
+    # --- Merge Actions By Collection ---
+    merge_base_action: PointerProperty(
+        type=bpy.types.Action,
+        name="Base Action",
+        description="Action to override: keeps its curves except where the "
+                    "override action animates a bone of the selected collections",
+    )
+    merge_override_action: PointerProperty(
+        type=bpy.types.Action,
+        name="Override Action",
+        description="Action whose curves of the selected bone collections "
+                    "override the base action",
+    )
+    merge_collections: EnumProperty(
+        name="Collections",
+        description="Bone collections whose curves are taken from the override action",
+        options={'ENUM_FLAG'},
+        items=_merge_collection_items,
+    )
+    merge_use_fake_user: BoolProperty(
+        name="Fake User",
+        description="Mark the merged action with a fake user",
+        default=True,
+    )
+
+
+class UNITY_FBX_PT_viewport_anim_utils(bpy.types.Panel):
+    bl_label = "Anim Utils"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Unity Utils"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'ARMATURE'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        settings = context.scene.unity_fbx_anim_utils
+
+        # --- Bone Collection From Name (collapsible sub-panel) ---
+        header, body = layout.panel("UNITY_FBX_bone_collection_from_name",
+                                    default_closed=False)
+        header.label(text="Bone Collection From Name", icon='GROUP_BONE')
+        if body:
+            body.prop(settings, "match_string")
+            body.prop(settings, "collection_name")
+            body.separator()
+            sub = body.column()
+            sub.use_property_split = False
+            sub.prop(settings, "use_bone_color")
+            color_col = sub.column()
+            color_col.enabled = settings.use_bone_color
+            color_col.use_property_split = True
+            color_col.prop(settings, "bone_color_mode", text="")
+            if settings.bone_color_mode == 'PALETTE':
+                color_col.prop(settings, "bone_color_palette", text="Palette")
+            else:
+                color_col.prop(settings, "custom_color", text="")
+            body.separator()
+            sub2 = body.column()
+            sub2.use_property_split = False
+            sub2.prop(settings, "set_display_as")
+            display_col = sub2.column()
+            display_col.enabled = settings.set_display_as
+            display_col.use_property_split = True
+            display_col.prop(settings, "display_as", text="Style")
+            body.separator()
+            body.operator(UNITY_FBX_OT_bone_collection_from_name.bl_idname,
+                          icon='GROUP_BONE')
+
+        layout.separator()
+
+        # --- Override Base Action By Collection (collapsible sub-panel) ---
+        header, body = layout.panel("UNITY_FBX_merge_actions", default_closed=True)
+        header.label(text="Override Base Action By Collection", icon='ACTION')
+        if body:
+            body.prop(settings, "merge_base_action")
+            body.prop(settings, "merge_override_action")
+            body.prop(settings, "merge_collections")
+            body.prop(settings, "merge_use_fake_user")
+            body.separator()
+            body.operator(UNITY_FBX_OT_merge_actions_by_collection.bl_idname,
+                          icon='ACTION')
+
+
+class UNITY_FBX_PT_viewport_import(bpy.types.Panel):
+    bl_label = "Import"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Unity Utils"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column()
+        col.operator(ImportFBX.bl_idname, text="Unity FBX (.fbx)", icon='IMPORT')
+        col.operator(ImportUnityAnim.bl_idname, text="Unity Animation Clip (.anim)",
+                     icon='ANIM')
+
+
+classes = (
+    ImportFBX,
+    ImportUnityAnim,
+    UnityFBXAnimUtilsSettings,
+    UNITY_FBX_OT_bone_collection_from_name,
+    UNITY_FBX_OT_merge_actions_by_collection,
+    UNITY_FBX_PT_viewport_anim_utils,
+    UNITY_FBX_PT_viewport_import,
+)
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    bpy.types.Scene.unity_fbx_anim_utils = PointerProperty(
+        type=UnityFBXAnimUtilsSettings)
+
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+
+    if hasattr(bpy.types.Scene, "unity_fbx_anim_utils"):
+        del bpy.types.Scene.unity_fbx_anim_utils
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

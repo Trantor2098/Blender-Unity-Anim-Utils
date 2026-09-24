@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-import difflib
-import json
 import math
 import os
 import zlib
@@ -15,157 +13,6 @@ from .humanoid_biped_profile import (
     DEFAULT_HUMANOID_PRESET,
     HUMANOID_PRESETS,
 )
-
-
-# ---------------------------------------------------------------------------
-# .anim path remapping (unity_fbx_anim_importer anim_remap.json)
-#
-# Same-rig clip sets share one remap file next to the rig FBX: direct matches
-# are recorded as "auto", missing paths are left for the user to fix by hand,
-# and the importer rewrites clip paths through the table before resolving.
-# ---------------------------------------------------------------------------
-
-REMAP_FILE_NAME = "anim_remap.json"
-
-
-def remap_file_path(directory):
-    """Remap table path for a rig directory (next to the FBX / clips)."""
-    return os.path.join(directory or ".", REMAP_FILE_NAME)
-
-
-def load_remap_table(directory):
-    """Load the user-edited remap table for a rig directory.
-
-    Returns {anim path: blender path}. Entries mapping to None/"auto" are
-    resolved at load time: "auto" keeps the original path (direct match),
-    None means "leave unresolved" (the importer will report it).
-    """
-    path = remap_file_path(directory)
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    # Accept both {"anim_path": "blender_path"} and the draft format
-    # {"mapping": {"anim_path": "blender_path"|null}} written by the scanner.
-    if isinstance(raw.get("mapping"), dict):
-        raw = raw["mapping"]
-    table = {}
-    for anim_path, blender_path in raw.items():
-        if not isinstance(anim_path, str):
-            continue
-        if blender_path == "auto":
-            table[anim_path] = anim_path
-        elif isinstance(blender_path, str) and blender_path:
-            table[anim_path] = blender_path
-        else:
-            table[anim_path] = None  # explicitly unmapped; keep to report
-    return table
-
-
-def _skeleton_path_map(armature):
-    """Map each armature bone to its full Blender hierarchy path."""
-    paths = {}
-    for bone in armature.data.bones:
-        names = []
-        current = bone
-        while current:
-            names.append(current.name)
-            current = current.parent
-        paths[bone.name] = "/".join(reversed(names))
-    return paths
-
-
-def _similar_candidates(anim_path, skeleton_paths, limit=8):
-    """Ranked Blender paths similar to an anim path, best first."""
-    leaf = anim_path.rsplit("/", 1)[-1]
-    scored = []
-    for bone_name, path in skeleton_paths.items():
-        ratio = difflib.SequenceMatcher(
-            None, anim_path.lower(), path.lower()).ratio()
-        leaf_ratio = difflib.SequenceMatcher(
-            None, leaf.lower(), bone_name.lower()).ratio()
-        scored.append((max(ratio, leaf_ratio), path))
-    scored.sort(reverse=True)
-    return [path for _score, path in scored[:limit]]
-
-
-def scan_remap_draft(anim_paths, armature, directory=None):
-    """Build a remap-table draft for the given clip paths.
-
-    Returns (mapping, report):
-      mapping: {anim path: "auto" | null} ready to dump as JSON. The user
-               replaces null values with Blender paths (or "auto" where the
-               scanner was wrong).
-      report:  per-path diagnostics for the scan log.
-    """
-    full_paths, suffix_paths = _bone_paths(armature)
-    skeleton_paths = _skeleton_path_map(armature)
-    existing = {}
-    if directory:
-        existing = load_remap_table(directory)
-        # Collapse resolved entries so re-scan keeps the user's choices.
-        existing = {k: v for k, v in existing.items() if v and v != "auto"}
-
-    mapping = {}
-    report = []
-    for anim_path in sorted(anim_paths):
-        if anim_path in existing:
-            mapping[anim_path] = existing[anim_path]
-            report.append((anim_path, "kept (user mapping)", existing[anim_path]))
-            continue
-        resolved = _resolve_bone(anim_path, full_paths, suffix_paths, armature)
-        if resolved:
-            mapping[anim_path] = "auto"
-            report.append((anim_path, "auto (direct match)", "auto"))
-            continue
-        candidates = _similar_candidates(anim_path, skeleton_paths)
-        mapping[anim_path] = None
-        report.append((anim_path, "UNRESOLVED", candidates))
-    return mapping, report
-
-
-def write_remap_draft(mapping, directory):
-    """Write the draft table next to the rig; returns the file path."""
-    path = remap_file_path(directory)
-    payload = {
-        "_comment": (
-            "anim path remap table: 'auto' = direct match kept as-is; "
-            "a Blender bone path = rewrite to that path; null = skip. "
-            "Shared by all clips of this rig."
-        ),
-        "mapping": mapping,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    return path
-
-
-def apply_remap_table(anim_paths, table):
-    """Rewrite clip paths through a loaded table.
-
-    Returns (rewritten, skipped): rewritten maps anim path -> new path;
-    skipped lists paths the table left unmapped (null) so the importer
-    reports them as unresolved.
-    """
-    rewritten = {}
-    skipped = []
-    for anim_path in anim_paths:
-        new_path = table.get(anim_path)
-        if new_path is None and anim_path in table:
-            skipped.append(anim_path)
-            continue
-        if new_path:
-            rewritten[anim_path] = new_path
-        else:
-            # Not in the table at all: untouched, regular resolution.
-            rewritten[anim_path] = anim_path
-    return rewritten, skipped
-
 
 
 def _finite_slope(slope, fallback):
@@ -558,7 +405,13 @@ def _has_misaligned_humanoid_data(curves, float_groups):
     ]
     if len(recognized) < 20:
         return False
-    constant_count = sum(_curve_is_constant(curve) for curve in recognized)
+    # A constant muscle is normal (walk cycles hold the torso rigid while the
+    # legs move).  The broken extractor table fills constant channels with
+    # zeros, so only near-zero constants are evidence of misalignment.
+    def _is_suspicious_constant(curve):
+        return (_curve_is_constant(curve)
+                and all(abs(float(key.value)) < 1.0e-6 for key in curve.keys))
+    constant_count = sum(_is_suspicious_constant(curve) for curve in recognized)
     if constant_count * 5 < len(recognized) * 4:
         return False
 
@@ -780,7 +633,8 @@ def import_clip(
         use_fake_user=True,
         name_collision_mode='OVERWRITE',
         neutralize_root_offset=False,
-        remap_directory=None):
+        bone_collection_filter=None,
+        patch_current_action=True):
     preset = HUMANOID_PRESETS.get(humanoid_preset)
     if preset is None:
         raise ValueError(f"Unknown Humanoid mapping preset: {humanoid_preset}")
@@ -791,24 +645,6 @@ def import_clip(
 
     full_paths, suffix_paths = _bone_paths(armature)
     curve_groups = {}
-    remapped_from = {}
-    if remap_directory:
-        table = load_remap_table(remap_directory)
-        if table:
-            anim_paths = {curve.path for kind in (
-                'rotation', 'euler', 'position', 'scale')
-                for curves in (
-                    clip.rotation_curves, clip.euler_curves,
-                    clip.position_curves, clip.scale_curves)
-                for curve in curves}
-            rewritten, _skipped = apply_remap_table(anim_paths, table)
-            remapped_from = {v: k for k, v in rewritten.items() if k != v}
-            for kind, curves in (
-                    ('rotation', clip.rotation_curves), ('euler', clip.euler_curves),
-                    ('position', clip.position_curves), ('scale', clip.scale_curves)):
-                for curve in curves:
-                    if curve.path in rewritten and rewritten[curve.path] != curve.path:
-                        curve.path = rewritten[curve.path]
     for kind, curves in (
             ('rotation', clip.rotation_curves), ('euler', clip.euler_curves),
             ('position', clip.position_curves), ('scale', clip.scale_curves)):
@@ -902,12 +738,47 @@ def import_clip(
         humanoid_hips_applied = True
     elif humanoid_count and has_humanoid_root and humanoid_hips_bone not in armature.data.bones:
         unresolved.append(f"Humanoid/Hips ({humanoid_hips_bone})")
+    # Optional restriction of the imported curves to a single bone collection
+    # (its child collections included): the remaining mapped bones keep their
+    # current animation/action curves untouched.
+    filtered_out = []
+    filter_allowed = None
+    if bone_collection_filter:
+        collection = armature.data.collections.get(bone_collection_filter)
+        if collection is None:
+            raise ValueError(f"Bone collection not found: {bone_collection_filter!r}")
+        filter_allowed = {bone.name for bone in collection.bones_recursive}
+        filtered_mapped = []
+        for entry in mapped:
+            if entry[1] in filter_allowed:
+                filtered_mapped.append(entry)
+            else:
+                filtered_out.append(entry[0])
+        mapped = filtered_mapped
+
     if not mapped:
-        raise ValueError("No Unity Transform or supported Humanoid curves matched the selected armature")
+        raise ValueError("No Unity Transform or supported Humanoid curves matched the selected armature"
+                         + (f" within the bone collection {bone_collection_filter!r}"
+                            if bone_collection_filter else ""))
+
+    animation_data = armature.animation_data_create()
+    current_action = animation_data.action
+
+    # With a bone collection filter the caller usually wants to patch the
+    # action that is already animating the armature: switching to a fresh
+    # clip-named action would drop the outside-collection animation that was
+    # imported from the previous clip.  Patch in place instead.
+    patching_current = (
+        bone_collection_filter is not None
+        and patch_current_action
+        and current_action is not None
+        and current_action.name != clip.name)
 
     action = None
     existing_action = bpy.data.actions.get(clip.name)
-    if existing_action is not None:
+    if patching_current:
+        action = current_action
+    elif existing_action is not None:
         if name_collision_mode == 'REUSE':
             # Keep the existing action as-is; the caller reports the skip.
             return None, 0, []
@@ -921,17 +792,35 @@ def import_clip(
         action = bpy.data.actions.new(clip.name)
     action.use_fake_user = bool(use_fake_user)
 
-    if not action.slots:
-        slot = action.slots.new(armature.id_type, "Slot")
-    else:
+    if action.slots:
         slot = action.slots[0]
+    else:
+        slot = action.slots.new(armature.id_type, "Slot")
     channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
-    if existing_action is not None and name_collision_mode == 'OVERWRITE':
-        # Drop the previous curves of the reused action so the new ones do not
-        # stack on top of the old ones.
+
+    # Decide which previous curves of the target action are dropped so the
+    # new ones do not stack on top of the old ones.
+    if patching_current or (existing_action is not None
+                            and action is existing_action
+                            and name_collision_mode == 'OVERWRITE'):
+        if bone_collection_filter is None and not patching_current:
+            replaced_paths = None  # No filter: replace the whole action.
+        else:
+            # Only the curves of the re-imported bones are dropped: the bones
+            # outside the collection keep their existing animation.
+            replaced_paths = set()
+            for _path, bone_name, _curves in mapped:
+                pose_bone = armature.pose.bones.get(bone_name)
+                if pose_bone is None:
+                    continue
+                replaced_paths.update((
+                    pose_bone.path_from_id("location"),
+                    pose_bone.path_from_id("rotation_quaternion"),
+                    pose_bone.path_from_id("scale"),
+                ))
         for fcurve in list(channelbag.fcurves):
-            channelbag.fcurves.remove(fcurve)
-    animation_data = armature.animation_data_create()
+            if replaced_paths is None or fcurve.data_path in replaced_paths:
+                channelbag.fcurves.remove(fcurve)
     animation_data.action = action
     animation_data.action_slot = slot
 
@@ -1060,16 +949,21 @@ def import_clip(
 
     if root_source_matrices is not None:
         if root_motion == 'ROOT_BONE':
-            source_rest = _matrix_from_property(root_bone.bone.get("unity_fbx_source_rest"))
-            if source_rest is None:
-                source_rest = root_bone.bone.matrix_local.copy()
-            correction = corrections[root_bone.name]
-            root_basis_matrices = [
-                correction.inverted_safe() @ source_rest.inverted_safe() @ matrix @ correction
-                for matrix in root_source_matrices
-            ]
-            _write_matrix_channels(
-                channelbag, root_bone, root_basis_matrices, frame_start, "Unity Root Motion")
+            # A bone collection filter that excludes the root bone also skips
+            # writing the extracted root motion onto it.
+            if filter_allowed is not None and root_bone.name not in filter_allowed:
+                root_source_matrices = None
+            else:
+                source_rest = _matrix_from_property(root_bone.bone.get("unity_fbx_source_rest"))
+                if source_rest is None:
+                    source_rest = root_bone.bone.matrix_local.copy()
+                correction = corrections[root_bone.name]
+                root_basis_matrices = [
+                    correction.inverted_safe() @ source_rest.inverted_safe() @ matrix @ correction
+                    for matrix in root_source_matrices
+                ]
+                _write_matrix_channels(
+                    channelbag, root_bone, root_basis_matrices, frame_start, "Unity Root Motion")
         elif root_motion == 'ARMATURE':
             _write_matrix_channels(
                 channelbag, armature, armature_root_matrices, frame_start, "Unity Root Motion")
@@ -1077,6 +971,8 @@ def import_clip(
     action["unity_source_sample_rate"] = clip.sample_rate
     action["unity_unresolved_paths"] = unresolved
     action["unity_duplicate_paths"] = duplicate_paths
+    action["unity_bone_collection_filter"] = bone_collection_filter or ""
+    action["unity_filtered_out_paths"] = filtered_out
     action["unity_root_motion"] = root_motion
     action["unity_neutralize_root_offset"] = bool(neutralize_root_offset)
     action["unity_humanoid_profile"] = preset["name"] if humanoid_count else ""
@@ -1086,4 +982,172 @@ def import_clip(
     action["unity_humanoid_warning"] = humanoid_data_warning
     action["unity_humanoid_bones"] = humanoid_count
     action["unity_humanoid_units"] = "degrees" if muscle_values_are_degrees else "normalized"
+    if humanoid_count and not humanoid_data_warning:
+        applied_ik = _apply_humanoid_foot_ik(
+            armature, action, channelbag, slot, clip, times, frame_start,
+            float_groups, root_motion, root_bone,
+            corrections, filter_allowed)
+        action["unity_humanoid_foot_ik"] = applied_ik
     return action, len(mapped), unresolved
+
+
+# --- Humanoid foot IK ----------------------------------------------------------
+#
+# Unity Humanoid clips drive the legs through muscle curves ONLY; per-bone
+# Transform curves for the leg chain do not exist.  Games therefore also
+# serialize {Left,Right}FootT/{Left,Right}FootQ float curves: the Avatar-space
+# IK target the engine's two-bone leg IK places each foot on.  Rebuilding the
+# legs from the muscle curves alone (as the importer does) misses part of the
+# stride: the foot slides on the ground.  This pass re-poses the leg chain
+# with an analytic two-bone IK so each foot bone lands exactly on its
+# serialized target.
+
+_FOOT_IK_CHAINS = (
+    # (foot bone, calf bone, thigh bone, Left/Right)
+    ('Bip001 L Foot', 'Bip001 L Calf', 'Bip001 L Thigh', 'Left'),
+    ('Bip001 R Foot', 'Bip001 R Calf', 'Bip001 R Thigh', 'Right'),
+)
+
+
+def _ik_solutions(chain_root, target_offsets, chain_lengths, pole_dir):
+    """Analytic two-bone IK: rotations (thigh, calf) placing the foot target.
+
+    `chain_root` is the world-space thigh head; `target_offsets` the world
+    foot targets per sample.  Returns (thigh rotations, calf rotations) in
+    world space, or (None, None) when the chain cannot reach.
+    """
+    pass
+
+
+def _apply_humanoid_foot_ik(
+        armature, action, channelbag, slot, clip, times, frame_start,
+        float_groups, root_motion, root_bone, corrections, filter_allowed):
+    """Re-pose each leg chain so the foot lands on its {Left,Right}FootT target.
+
+    Returns the list of chains actually re-posed.
+    """
+
+
+# --- Merge actions by bone collection ----------------------------------------
+
+def _action_slot_channelbags(action):
+    """Yield the channelbag of each slot of `action` (Blender 5.x slots API)."""
+    for slot in action.slots:
+        channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+        if channelbag is not None:
+            yield channelbag
+
+
+def _fcurve_bone_name(data_path):
+    """Bone name from a pose-bone fcurve data path, or None."""
+    prefix = 'pose.bones["'
+    start = data_path.find(prefix)
+    if start < 0:
+        return None
+    start += len(prefix)
+    end = data_path.find('"]', start)
+    if end < 0:
+        return None
+    return data_path[start:end]
+
+
+def merge_actions_by_collection(
+        armature, source_actions, target_name,
+        bone_collections, use_fake_user=True,
+        frame_offsets=None):
+    """Merge the curves of the bones in `bone_collections` from each source
+    action into a new (or reused) action named `target_name`.
+
+    `source_actions` is processed in order; when several sources animate the
+    same bone channel, the later source wins.  `frame_offsets` (one per
+    source, default 0) shifts each source's keyframes in frames, so clips can
+    be concatenated back to back.
+    Returns (action, merged_fcurve_count, skipped_fcurve_count).
+    """
+    if not source_actions:
+        raise ValueError("No source actions to merge")
+    if not bone_collections:
+        raise ValueError("No bone collections selected")
+
+    arm_data = armature.data
+    allowed = set()
+    for collection_name in bone_collections:
+        collection = arm_data.collections.get(collection_name)
+        if collection is None:
+            raise ValueError(f"Bone collection not found: {collection_name!r}")
+        allowed.update(bone.name for bone in collection.bones_recursive)
+    if not allowed:
+        raise ValueError("The selected bone collections contain no bones")
+
+    if frame_offsets is None:
+        frame_offsets = [0] * len(source_actions)
+    elif len(frame_offsets) != len(source_actions):
+        raise ValueError("frame_offsets must match the number of source actions")
+
+    # (data_path, index) -> (source order, fcurve, offset) ; later entries win.
+    winners = {}
+    skipped = 0
+    for order, (action, offset) in enumerate(zip(source_actions, frame_offsets)):
+        for channelbag in _action_slot_channelbags(action):
+            for fcurve in channelbag.fcurves:
+                bone_name = _fcurve_bone_name(fcurve.data_path)
+                if bone_name is None or bone_name not in allowed:
+                    skipped += 1
+                    continue
+                key = (fcurve.data_path, fcurve.array_index)
+                previous = winners.get(key)
+                if previous is None or order >= previous[0]:
+                    winners[key] = (order, fcurve, offset)
+    if not winners:
+        raise ValueError(
+            "None of the source actions animates a bone of the selected collections")
+
+    action = bpy.data.actions.get(target_name)
+    if action is None:
+        action = bpy.data.actions.new(target_name)
+    action.use_fake_user = bool(use_fake_user)
+
+    if action.slots:
+        slot = action.slots[0]
+    else:
+        slot = action.slots.new(armature.id_type, "Slot")
+    channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+
+    # The curves already in the target action are the base layer: they stay
+    # unless one of the sources animates the same channel (it wins), and any
+    # bone the sources do not animate keeps its existing curves.
+    merged = 0
+    kept = 0
+    existing_keys = set()
+    for fcurve in list(channelbag.fcurves):
+        key = (fcurve.data_path, fcurve.array_index)
+        if key in winners:
+            channelbag.fcurves.remove(fcurve)
+            continue
+        bone_name = _fcurve_bone_name(fcurve.data_path)
+        if bone_name is None or bone_name not in allowed:
+            continue  # Outside the collections: kept untouched, not counted.
+        existing_keys.add(key)
+        kept += 1
+
+    for (data_path, array_index), (_order, source_fcurve, offset) in winners.items():
+        fcurve = channelbag.fcurves.new(data_path, index=array_index,
+                                        group_name=source_fcurve.group.name
+                                        if source_fcurve.group else None)
+        source_points = source_fcurve.keyframe_points
+        fcurve.keyframe_points.add(len(source_points))
+        coordinates = []
+        for point in source_points:
+            coordinates.extend((point.co[0] + offset, point.co[1]))
+        fcurve.keyframe_points.foreach_set('co', coordinates)
+        for destination, source in zip(fcurve.keyframe_points, source_points):
+            destination.interpolation = source.interpolation
+            destination.easing = source.easing
+            destination.handle_left_type = source.handle_left_type
+            destination.handle_right_type = source.handle_right_type
+        fcurve.update()
+        merged += 1
+
+    action["unity_merged_from"] = [action.name for action in source_actions]
+    action["unity_merged_collections"] = list(bone_collections)
+    return action, merged, skipped + kept
